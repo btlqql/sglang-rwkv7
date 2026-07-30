@@ -117,6 +117,85 @@ class TestRwkv7AcceptanceReport(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unsupported schema"):
                 REPORT.load_jsonl([path])
 
+    def test_quant_memory_must_be_strictly_lower_than_dense(self):
+        model = "rwkv7-g1-1.5b"
+        dense = row(model, "dense", prefill=200, decode=200, e2e=180)
+        quant = row(model, "w8", prefill=220, decode=210, e2e=190)
+        qwen = row("qwen3.5-2b", "dense", prefill=100, decode=100, e2e=90)
+        albatross = {
+            (1, 1): {"tok_s_p50": 100},
+            (1, 128): {"tok_s_p50": 100},
+        }
+        memory = [
+            {
+                "schema": "rwkv7-serving-memory-v1",
+                "model": model,
+                "mode": "dense",
+                "model_weight_memory_gb": 3.0,
+            },
+            {
+                "schema": "rwkv7-serving-memory-v1",
+                "model": model,
+                "mode": "w8",
+                "model_weight_memory_gb": 2.5,
+            },
+        ]
+        report = REPORT.analyze(
+            candidate_rows=[dense, quant],
+            qwen_rows={model: [qwen]},
+            albatross_rows={model: albatross},
+            models=[model],
+            modes=["dense", "w8"],
+            batch_sizes=[1],
+            prompt_lengths=[128],
+            decode_lengths=[128],
+            dense_mode="dense",
+            qwen_minimum=1.0,
+            albatross_minimum=1.0,
+            quant_minimum=1.0,
+            active_work_factors={},
+            active_work_minimums={},
+            require_active_work=False,
+            memory_rows=memory,
+            require_memory=True,
+        )
+        self.assertTrue(report["passed"])
+        self.assertEqual(
+            report["memory_summary"], {"passed": 2, "failed": 0, "missing": 0}
+        )
+        gate = report["memory_cells"][1]["gates"]["quant_dense_model_memory_ratio"]
+        self.assertAlmostEqual(gate["value"], 2.5 / 3.0)
+
+        memory[1]["model_weight_memory_gb"] = 3.0
+        failed = REPORT.analyze(
+            candidate_rows=[dense, quant],
+            qwen_rows={model: [qwen]},
+            albatross_rows={model: albatross},
+            models=[model],
+            modes=["dense", "w8"],
+            batch_sizes=[1],
+            prompt_lengths=[128],
+            decode_lengths=[128],
+            dense_mode="dense",
+            qwen_minimum=1.0,
+            albatross_minimum=1.0,
+            quant_minimum=1.0,
+            active_work_factors={},
+            active_work_minimums={},
+            require_active_work=False,
+            memory_rows=memory,
+            require_memory=True,
+        )
+        self.assertFalse(failed["passed"])
+        self.assertEqual(failed["memory_summary"]["failed"], 1)
+
+    def test_memory_loader_rejects_wrong_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "memory.jsonl"
+            path.write_text(json.dumps({"schema": "wrong"}) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "unsupported memory schema"):
+                REPORT.load_memory_jsonl([path])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -43,15 +43,20 @@ python benchmark/rwkv7/analyze_acceptance_matrix.py \
   --candidate results/rwkv-dense.jsonl \
   --candidate results/rwkv-w8.jsonl \
   --candidate results/rwkv-w4.jsonl \
+  --memory results/model-memory.jsonl \
   --qwen rwkv7-g1-1.5b=results/qwen3.5-2b.jsonl \
   --qwen rwkv7-g1-2.9b=results/qwen3.5-4b.jsonl \
   --qwen rwkv7-g1-7.2b=results/qwen3.5-9b.jsonl \
   --albatross rwkv7-g1-1.5b=results/albatross-1.5b.log \
   --albatross rwkv7-g1-2.9b=results/albatross-2.9b.log \
   --albatross rwkv7-g1-7.2b=results/albatross-7.2b.log \
-  --active-work-factor rwkv7-g1-1.5b=1.0 \
+  --active-work-factor rwkv7-g1-1.5b=1.3333333333 \
+  --active-work-factor rwkv7-g1-2.9b=1.3793103448 \
+  --active-work-factor rwkv7-g1-7.2b=1.25 \
   --active-work-minimum rwkv7-g1-1.5b=1.75 \
-  --require-active-work --strict \
+  --active-work-minimum rwkv7-g1-2.9b=1.75 \
+  --active-work-minimum rwkv7-g1-7.2b=1.75 \
+  --require-active-work --require-memory --strict \
   --output results/acceptance-report.json
 ```
 
@@ -59,6 +64,19 @@ Active-work factors and thresholds are explicit inputs so a model-pair change
 cannot silently alter the rule. Albatross has no HTTP serving boundary, so its
 fixed-forward rows gate prefill and decode only; Qwen JSONL gates TTFT, TPOT,
 E2E, prefill, and decode in the same serving API.
+
+The optional memory input becomes mandatory with `--require-memory`. It uses
+one record per model and mode; quantized model-weight memory must be strictly
+lower than the matched dense record:
+
+```json
+{"schema":"rwkv7-serving-memory-v1","model":"rwkv7-g1-1.5b","mode":"dense","model_weight_memory_gb":3.03}
+{"schema":"rwkv7-serving-memory-v1","model":"rwkv7-g1-1.5b","mode":"w8-accuracy","model_weight_memory_gb":2.69}
+```
+
+Server peak, active-state, and configured state-pool memory may be retained as
+additional fields. They do not replace `model_weight_memory_gb`, because a
+fixed `mem_fraction_static` can otherwise hide a real weight-memory reduction.
 
 ## Dense server
 

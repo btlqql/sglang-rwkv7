@@ -2,8 +2,9 @@
 """Build a fail-closed RWKV-7 serving acceptance report.
 
 Join SGLang candidate JSONL with matched Qwen3.5 serving JSONL, raw Albatross
-``RESULT B=... T=...`` logs, and dense RWKV-7 rows used by quantization gates.
-Missing candidate or baseline data remains visible in the denominator.
+``RESULT B=... T=...`` logs, dense RWKV-7 rows used by quantization gates, and
+per-mode model-memory records. Missing candidate or baseline data remains
+visible in the denominator.
 """
 
 from __future__ import annotations
@@ -33,6 +34,12 @@ class CellKey:
     batch_size: int
     prompt_tokens: int
     decode_tokens: int
+
+
+@dataclass(frozen=True, order=True)
+class MemoryKey:
+    model: str
+    mode: str
 
 
 def csv_strings(value: str) -> list[str]:
@@ -94,6 +101,32 @@ def load_jsonl(paths: Iterable[Path]) -> list[dict[str, Any]]:
     return rows
 
 
+def load_memory_jsonl(paths: Iterable[Path]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for path in paths:
+        for line_number, raw in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if not raw.strip():
+                continue
+            try:
+                row = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{line_number}: invalid JSON: {exc}") from exc
+            if row.get("schema") != "rwkv7-serving-memory-v1":
+                raise ValueError(
+                    f"{path}:{line_number}: unsupported memory schema "
+                    f"{row.get('schema')!r}"
+                )
+            memory_gb = float(row["model_weight_memory_gb"])
+            if memory_gb <= 0:
+                raise ValueError(
+                    f"{path}:{line_number}: model_weight_memory_gb must be positive"
+                )
+            rows.append(row)
+    return rows
+
+
 def serving_key(row: dict[str, Any]) -> CellKey:
     return CellKey(
         model=str(row["model"]),
@@ -107,6 +140,15 @@ def serving_key(row: dict[str, Any]) -> CellKey:
 def index_serving(rows: Iterable[dict[str, Any]]) -> dict[CellKey, dict[str, Any]]:
     """Index rows with last-row-wins semantics for intentional reruns."""
     return {serving_key(row): row for row in rows}
+
+
+def memory_key(row: dict[str, Any]) -> MemoryKey:
+    return MemoryKey(model=str(row["model"]), mode=str(row["mode"]))
+
+
+def index_memory(rows: Iterable[dict[str, Any]]) -> dict[MemoryKey, dict[str, Any]]:
+    """Index memory rows with last-row-wins semantics for intentional reruns."""
+    return {memory_key(row): row for row in rows}
 
 
 def parse_albatross_log(path: Path) -> dict[tuple[int, int], dict[str, float | int]]:
@@ -146,6 +188,15 @@ def add_gate(
     minimum: float,
 ) -> None:
     gates[name] = {"value": value, "minimum": minimum, "pass": value >= minimum}
+
+
+def add_maximum_gate(
+    gates: dict[str, dict[str, float | bool]],
+    name: str,
+    value: float,
+    maximum: float,
+) -> None:
+    gates[name] = {"value": value, "maximum": maximum, "pass": value <= maximum}
 
 
 def expected_keys(
@@ -196,6 +247,9 @@ def analyze(
     active_work_factors: dict[str, float],
     active_work_minimums: dict[str, float],
     require_active_work: bool,
+    memory_rows: Iterable[dict[str, Any]] = (),
+    quant_memory_maximum: float = 0.999999,
+    require_memory: bool = False,
 ) -> dict[str, Any]:
     candidate = index_serving(candidate_rows)
     qwen = {model: index_serving(rows) for model, rows in qwen_rows.items()}
@@ -337,6 +391,55 @@ def analyze(
     counts = {status: 0 for status in ("passed", "failed", "missing")}
     for row in report_rows:
         counts[row["status"]] += 1
+
+    memory = index_memory(memory_rows)
+    memory_report_rows: list[dict[str, Any]] = []
+    if require_memory or memory:
+        for model in models:
+            dense_memory = memory.get(MemoryKey(model, dense_mode))
+            for mode in modes:
+                key = MemoryKey(model, mode)
+                current = memory.get(key)
+                memory_report: dict[str, Any] = {"model": model, "mode": mode}
+                if current is None:
+                    memory_report.update(status="missing", missing=["memory_record"])
+                    memory_report_rows.append(memory_report)
+                    continue
+
+                gates: dict[str, dict[str, float | bool]] = {}
+                missing: list[str] = []
+                if mode != dense_mode:
+                    if dense_memory is None:
+                        missing.append("dense_memory_reference")
+                    else:
+                        add_maximum_gate(
+                            gates,
+                            "quant_dense_model_memory_ratio",
+                            ratio(
+                                float(current["model_weight_memory_gb"]),
+                                float(dense_memory["model_weight_memory_gb"]),
+                            ),
+                            quant_memory_maximum,
+                        )
+                failures = sorted(
+                    name for name, gate in gates.items() if not gate["pass"]
+                )
+                status = "missing" if missing else "failed" if failures else "passed"
+                memory_report.update(
+                    status=status,
+                    model_weight_memory_gb=float(current["model_weight_memory_gb"]),
+                    missing=missing,
+                    failed_gates=failures,
+                    gates=gates,
+                )
+                memory_report_rows.append(memory_report)
+
+    memory_counts = {status: 0 for status in ("passed", "failed", "missing")}
+    for row in memory_report_rows:
+        memory_counts[row["status"]] += 1
+    memory_passed = not memory_report_rows or (
+        memory_counts["failed"] == 0 and memory_counts["missing"] == 0
+    )
     return {
         "schema": "rwkv7-serving-acceptance-report-v1",
         "matrix": {
@@ -354,10 +457,14 @@ def analyze(
             "active_work_factors": active_work_factors,
             "active_work_minimums": active_work_minimums,
             "require_active_work": require_active_work,
+            "quant_memory_maximum": quant_memory_maximum,
+            "require_memory": require_memory,
         },
         "summary": counts,
-        "passed": counts["failed"] == 0 and counts["missing"] == 0,
+        "memory_summary": memory_counts,
+        "passed": (counts["failed"] == 0 and counts["missing"] == 0 and memory_passed),
         "cells": report_rows,
+        "memory_cells": memory_report_rows,
     }
 
 
@@ -387,6 +494,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qwen-minimum", type=float, default=1.0)
     parser.add_argument("--albatross-minimum", type=float, default=1.0)
     parser.add_argument("--quant-minimum", type=float, default=1.0)
+    parser.add_argument("--memory", action="append", type=Path, default=[])
+    parser.add_argument("--quant-memory-maximum", type=float, default=0.999999)
+    parser.add_argument("--require-memory", action="store_true")
     parser.add_argument(
         "--active-work-factor", action="append", default=[], metavar="MODEL=FACTOR"
     )
@@ -401,6 +511,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if not 0 < args.quant_memory_maximum < 1:
+        raise ValueError("--quant-memory-maximum must be greater than 0 and below 1")
     qwen_paths = parse_mapping(args.qwen, value_name="JSONL")
     albatross_paths = parse_mapping(args.albatross, value_name="LOG")
     report = analyze(
@@ -428,6 +540,9 @@ def main() -> int:
             args.active_work_minimum, value_name="MINIMUM"
         ),
         require_active_work=args.require_active_work,
+        memory_rows=load_memory_jsonl(args.memory),
+        quant_memory_maximum=args.quant_memory_maximum,
+        require_memory=args.require_memory,
     )
     rendered = json.dumps(report, indent=2, sort_keys=True)
     print(rendered)
