@@ -61,6 +61,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_gather,
 )
+from sglang.srt.layers.activation import ReLU2
 from sglang.srt.layers.attention.rwkv7_kernels.fused import (
     fused_gate_corr,
     fused_kk_kmix,
@@ -88,6 +89,7 @@ from sglang.srt.utils import add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
 
+_RWKV7_W8A8_CONFIG: Optional[QuantizationConfig] = None
 _online_marlin_quantize_weight = None
 if (
     torch.cuda.is_available()
@@ -141,6 +143,16 @@ def _rwkv7_w4_policy() -> str:
     return policy
 
 
+def _rwkv7_w8a8_config() -> QuantizationConfig:
+    """Lazily import W8A8 so legacy CUDA dense/BnB paths need no sgl-kernel."""
+    global _RWKV7_W8A8_CONFIG
+    if _RWKV7_W8A8_CONFIG is None:
+        from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+
+        _RWKV7_W8A8_CONFIG = W8A8Int8Config()
+    return _RWKV7_W8A8_CONFIG
+
+
 def _rwkv7_projection_quant_config(
     quant_config: Optional[QuantizationConfig],
     projection: str,
@@ -152,7 +164,9 @@ def _rwkv7_projection_quant_config(
     ``projection`` is one of ``attention``, ``ffn_key``, or ``ffn_value``.
     The speed policies quantize every large projection. Balanced policies keep
     recurrent attention dense. Accuracy policies additionally protect the W8
-    sqReLU expansion and the most sensitive edge FFN layers.
+    sqReLU expansion and the most sensitive edge FFN layers. The W4 accuracy
+    lane interleaves W4 and W8 in its middle FFN layers: W4 retains most of the
+    compression/decode gain while W8 closes Marlin's large-batch prefill gap.
     """
     if quant_config is None:
         return None
@@ -186,6 +200,8 @@ def _rwkv7_projection_quant_config(
             edge_layers = min(4, max(1, num_hidden_layers // 6))
             if layer_id < edge_layers or layer_id >= num_hidden_layers - edge_layers:
                 return None
+            if layer_id % 2:
+                return _rwkv7_w8a8_config()
 
     return quant_config
 
@@ -548,11 +564,12 @@ class Rwkv7FeedForward(nn.Module):
         self.hidden_size = H
         inter = config.intermediate_size
         self.x_k = nn.Parameter(torch.zeros(H))
+        self.activation = ReLU2()
         # W8A8 on the expansion projection perturbs values before sqReLU,
         # which squares that activation error. Keep ``key`` dense and quantize
         # the equally large contraction projection (``value``); this is the
-        # conservative W8 accuracy lane. W4 quantizes both FFN projections in
-        # middle layers while its accuracy policy protects edge layers.
+        # conservative W8 accuracy lane. W4 accuracy protects edge layers and
+        # interleaves W4/W8 FFN blocks in the middle of the stack.
         key_quant_config = _rwkv7_projection_quant_config(
             quant_config,
             "ffn_key",
@@ -583,7 +600,7 @@ class Rwkv7FeedForward(nn.Module):
         shifted = be.token_shift(x, self.layer_id, 1, forward_batch)
         xk = x + self.x_k * (shifted - x)
         k = self.key(xk)[0]
-        act = torch.relu(k) ** 2
+        act = self.activation(k)
         out = self.value(act)[0]
         return out
 

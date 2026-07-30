@@ -37,7 +37,7 @@ class TestRwkv7QuantPolicy(unittest.TestCase):
                 quant,
             )
 
-    def test_w4_accuracy_quantizes_only_middle_ffn_layers(self):
+    def test_w4_accuracy_interleaves_w4_and_w8_in_middle_ffn_layers(self):
         quant = FakeQuantConfig("marlin")
         with patch.dict(os.environ, {"SGLANG_RWKV7_W4_POLICY": "accuracy"}):
             self.assertIsNone(
@@ -49,6 +49,14 @@ class TestRwkv7QuantPolicy(unittest.TestCase):
                 )
             self.assertIs(
                 _rwkv7_projection_quant_config(quant, "ffn_key", 12, 24), quant
+            )
+            self.assertEqual(
+                _rwkv7_projection_quant_config(quant, "ffn_key", 13, 24).get_name(),
+                "w8a8_int8",
+            )
+            self.assertEqual(
+                _rwkv7_projection_quant_config(quant, "ffn_value", 13, 24).get_name(),
+                "w8a8_int8",
             )
 
     def test_speed_policies_quantize_every_large_projection(self):
