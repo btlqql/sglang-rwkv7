@@ -39,7 +39,10 @@ class TestRwkv7QuantPolicy(unittest.TestCase):
 
     def test_w4_accuracy_interleaves_w4_and_w8_in_middle_ffn_layers(self):
         quant = FakeQuantConfig("marlin")
-        with patch.dict(os.environ, {"SGLANG_RWKV7_W4_POLICY": "accuracy"}):
+        with patch.dict(os.environ, {"SGLANG_RWKV7_W4_POLICY": "accuracy"}), patch(
+            "sglang.srt.models.rwkv7._rwkv7_w8a8_config",
+            return_value=FakeQuantConfig("w8a8_int8"),
+        ):
             self.assertIsNone(
                 _rwkv7_projection_quant_config(quant, "attention", 12, 24)
             )

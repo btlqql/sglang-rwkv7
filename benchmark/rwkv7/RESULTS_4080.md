@@ -1,6 +1,6 @@
 # RTX 4080 RWKV-7 engineering snapshot
 
-Date: 2026-07-30
+Date: 2026-07-31
 
 This page records the current Ada optimization slice. It is intentionally
 narrower than the full acceptance contract in `RWKV7_HF_PARITY.md`: one
@@ -8,8 +8,10 @@ RWKV-7 1.5B checkpoint, batch size 8, and one RTX 4080. It is an engineering
 snapshot, not a claim that the 216-cell, multi-model, or multi-hardware matrix
 is complete.
 
-Raw per-run JSONL and the public environment manifest are stored under
-[`results/2026-07-30/rtx-4080`](results/2026-07-30/rtx-4080/).
+The matched dense/W8/W4 raw JSONL, alignment output, serving-feature output,
+and public environment manifest are stored under
+[`results/2026-07-31/rtx-4080`](results/2026-07-31/rtx-4080/). The earlier
+strict FP32-state evidence remains under `results/2026-07-30/rtx-4080`.
 
 ## Workload
 
@@ -21,7 +23,7 @@ Raw per-run JSONL and the public environment manifest are stored under
 - decode lengths per request: 128 and 512 tokens;
 - greedy decoding with EOS ignored;
 - recurrent radix cache flushed before each sample;
-- one warm-up and the median of three measured samples;
+- two warm-ups and the median of five measured samples;
 - full CUDA Graph decode at batch sizes 1/2/4/8;
 - fixed-shape full-prefill CUDA Graph buckets at 1024/4096/16384 packed tokens.
 
@@ -37,10 +39,11 @@ The default policy is `accuracy`.
 | Mode | Quantized projections | Dense protections |
 | --- | --- | --- |
 | W8 accuracy | middle FFN value projections | attention, FFN key, first/last FFN value, low-rank controls, lm_head |
-| W4 accuracy | middle-layer FFN key/value projections | attention, first/last four FFN blocks, low-rank controls, lm_head |
+| W4 hybrid accuracy | middle-layer FFN key/value, interleaved W4/W8 by layer | attention, first/last four FFN blocks, low-rank controls, lm_head |
 
-`balanced` and `speed` are explicit opt-in policies. They increase compression
-and throughput but did not pass the same alignment gate in this snapshot.
+`balanced` and `speed` are explicit pure-W4 opt-in policies. The default hybrid
+accuracy policy keeps meaningful W4 coverage but uses W8 in alternating middle
+FFN blocks to close Marlin's large-batch prefill gap.
 
 ## Model-weight memory
 
@@ -51,7 +54,7 @@ configured server state pool or total process peak.
 | --- | ---: | ---: |
 | Dense FP16 | 3.03 GB | reference |
 | W8 accuracy | 2.69 GB | -11.2% |
-| W4 accuracy | 2.35 GB | -22.4% |
+| W4 hybrid accuracy | 2.44 GB | -19.5% |
 
 ## FP16-state performance lane
 
@@ -61,34 +64,34 @@ an explicit performance/precision choice rather than the strict default.
 
 | Prompt | Decode | Mode | Prefill tok/s | Decode tok/s | E2E tok/s | Prefill / dense | Decode / dense | E2E / dense |
 | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 128 | 128 | dense | 23,033.3 | 1,099.2 | 1,057.2 | 1.000x | 1.000x | 1.000x |
-| 128 | 128 | W8 accuracy | 26,431.2 | 1,169.3 | 1,128.4 | 1.148x | 1.064x | 1.067x |
-| 128 | 128 | W4 accuracy | 22,668.9 | 1,293.1 | 1,232.9 | **0.984x** | 1.176x | 1.166x |
-| 128 | 512 | dense | 23,557.6 | 1,107.6 | 1,096.9 | 1.000x | 1.000x | 1.000x |
-| 128 | 512 | W8 accuracy | 27,302.2 | 1,188.2 | 1,177.7 | 1.159x | 1.073x | 1.074x |
-| 128 | 512 | W4 accuracy | 22,975.4 | 1,292.5 | 1,277.0 | **0.975x** | 1.167x | 1.164x |
-| 512 | 128 | dense | 25,501.5 | 1,106.4 | 949.0 | 1.000x | 1.000x | 1.000x |
-| 512 | 128 | W8 accuracy | 29,768.0 | 1,192.7 | 1,035.3 | 1.167x | 1.078x | 1.091x |
-| 512 | 128 | W4 accuracy | 25,572.3 | 1,311.2 | 1,095.1 | 1.003x | 1.185x | 1.154x |
-| 512 | 512 | dense | 25,582.8 | 1,106.9 | 1,063.0 | 1.000x | 1.000x | 1.000x |
-| 512 | 512 | W8 accuracy | 29,874.2 | 1,193.4 | 1,149.7 | 1.168x | 1.078x | 1.082x |
-| 512 | 512 | W4 accuracy | 25,879.4 | 1,317.6 | 1,256.4 | 1.012x | 1.190x | 1.182x |
-| 2048 | 128 | dense | 24,203.1 | 1,106.4 | 641.9 | 1.000x | 1.000x | 1.000x |
-| 2048 | 128 | W8 accuracy | 27,160.0 | 1,193.0 | 703.8 | 1.122x | 1.078x | 1.096x |
-| 2048 | 128 | W4 accuracy | 24,091.2 | 1,317.7 | 704.7 | **0.995x** | 1.191x | 1.098x |
-| 2048 | 512 | dense | 24,252.3 | 1,106.4 | 937.3 | 1.000x | 1.000x | 1.000x |
-| 2048 | 512 | W8 accuracy | 27,111.8 | 1,193.5 | 1,016.5 | 1.118x | 1.079x | 1.085x |
-| 2048 | 512 | W4 accuracy | 24,007.7 | 1,318.0 | 1,082.4 | **0.990x** | 1.191x | 1.155x |
+| 128 | 128 | dense | 23,545.4 | 1,105.6 | 1,063.9 | 1.000x | 1.000x | 1.000x |
+| 128 | 128 | W8 accuracy | 26,849.0 | 1,181.9 | 1,140.7 | 1.140x | 1.069x | 1.072x |
+| 128 | 128 | W4 hybrid accuracy | 25,690.6 | 1,258.4 | 1,208.1 | 1.091x | 1.138x | 1.136x |
+| 128 | 512 | dense | 23,875.8 | 1,114.3 | 1,103.5 | 1.000x | 1.000x | 1.000x |
+| 128 | 512 | W8 accuracy | 28,088.8 | 1,202.3 | 1,191.9 | 1.176x | 1.079x | 1.080x |
+| 128 | 512 | W4 hybrid accuracy | 25,689.8 | 1,259.0 | 1,246.2 | 1.076x | 1.130x | 1.129x |
+| 512 | 128 | dense | 26,499.1 | 1,112.4 | 958.9 | 1.000x | 1.000x | 1.000x |
+| 512 | 128 | W8 accuracy | 31,075.3 | 1,198.3 | 1,045.1 | 1.173x | 1.077x | 1.090x |
+| 512 | 128 | W4 hybrid accuracy | 28,961.6 | 1,269.9 | 1,087.6 | 1.093x | 1.142x | 1.134x |
+| 512 | 512 | dense | 26,415.4 | 1,113.1 | 1,070.0 | 1.000x | 1.000x | 1.000x |
+| 512 | 512 | W8 accuracy | 31,013.5 | 1,197.5 | 1,154.9 | 1.174x | 1.076x | 1.079x |
+| 512 | 512 | W4 hybrid accuracy | 29,278.8 | 1,275.2 | 1,223.9 | 1.108x | 1.146x | 1.144x |
+| 2048 | 128 | dense | 25,106.3 | 1,112.8 | 654.0 | 1.000x | 1.000x | 1.000x |
+| 2048 | 128 | W8 accuracy | 28,237.3 | 1,199.3 | 716.4 | 1.125x | 1.078x | 1.095x |
+| 2048 | 128 | W4 hybrid accuracy | 27,158.9 | 1,283.3 | 733.8 | 1.082x | 1.153x | 1.122x |
+| 2048 | 512 | dense | 25,066.0 | 1,113.2 | 946.8 | 1.000x | 1.000x | 1.000x |
+| 2048 | 512 | W8 accuracy | 28,231.6 | 1,199.0 | 1,026.6 | 1.126x | 1.077x | 1.084x |
+| 2048 | 512 | W4 hybrid accuracy | 27,155.4 | 1,280.1 | 1,078.4 | 1.083x | 1.150x | 1.139x |
 
 Current result:
 
-- W8 accuracy is faster than dense in prefill, decode, and end-to-end throughput
-  in all six measured cells.
-- W4 accuracy is faster in every decode and end-to-end cell. Four prefill
-  cells remain below dense; the worst deficit is 2.5%.
+- W8 accuracy is faster than dense in all 18 measured prefill/decode/E2E gates.
+- W4 hybrid accuracy is also faster in all 18 gates. Its minimum gains are
+  7.6% prefill, 13.0% decode, and 12.2% end to end.
 
-## Strict FP32-state W8 lane
+## Prior strict FP32-state W8 lane
 
+The following commit-`a590b2a` lane is retained from the 2026-07-30 evidence.
 FP32 recurrent state passes the chunk-boundary state-cache equality gate. It
 retains the W8 prefill, decode, and end-to-end gain while making the recurrent
 state-precision cost explicit rather than hiding it in the quantized ratio.
@@ -117,11 +120,11 @@ quantization error.
 
 | Mode | Max chosen-token logprob error | Mean error | Mean top-10 overlap | Teacher-forced top-1 agreement | Gate |
 | --- | ---: | ---: | ---: | ---: | --- |
-| W8 accuracy | 0.1055 | 0.0156 | 0.9656 | 1.0000 | pass (`0.25 / 0.80 / 0.90`) |
-| W4 accuracy | 0.5210 | 0.0760 | 0.8586 | 0.9766 | preliminary pass (`1.00 / 0.80 / 0.90`) |
+| W8 accuracy | 0.1025 | 0.0156 | 0.9664 | 1.0000 | pass (`0.25 / 0.80 / 0.90`) |
+| W4 hybrid accuracy | 0.4668 | 0.0518 | 0.9000 | 0.9922 | pass (`1.00 / 0.80 / 0.90`) |
 
 W8 reproduced all four 32-token natural-prompt continuations in the measured
-FP16-state run. W4 reproduced three of four. Long synthetic free-running
+FP16-state run. W4 hybrid reproduced three of four. Long synthetic free-running
 sequences can still diverge, so the W4 result is not presented as final
 llama.cpp-quality quantization parity.
 
@@ -129,9 +132,10 @@ llama.cpp-quality quantization parity.
 
 - The isolated native FP16-state WKV kernel measured 11-15% faster than the
   matched Albatross WKV microkernel for sequence lengths 128/512/2048.
-- End to end, the current dense path is still approximately 0.827-0.875x
-  Albatross prefill and 0.941-0.951x Albatross decode. Projection, norm, graph,
-  and serving overhead therefore remain the main same-model gap.
+- The prior end-to-end dense run was approximately 0.827-0.875x Albatross
+  prefill and 0.941-0.951x Albatross decode. The new fused ReLU2 path improves
+  dense prefill, but the matched Albatross rerun is still pending; no updated
+  end-to-end Albatross ratio is inferred from unmatched measurements.
 - The existing HF-derived Qwen3.5 batch-8 speed gate was green in these six
   dense cells. This SGLang checkout does not yet implement
   `Qwen3_5ForConditionalGeneration`, so a same-runtime SGLang Qwen rerun is
@@ -144,16 +148,17 @@ llama.cpp-quality quantization parity.
 - zero-length graph padding for token shift and WKV state: tested;
 - dynamic-batch duplicate isolation: passed;
 - recurrent cache select/restore and 128-token hit: passed in strict FP32 state;
-- W4 accuracy feature harness: passed in the measured FP16-state setup;
+- W4 hybrid accuracy feature harness: deterministic replay, duplicate-request
+  isolation, cold/warm chunked-prefill equality, and a 128-token state-cache
+  hit all passed in the measured FP16-state setup;
 - W8 FP16-state cache-boundary exactness: not passed; use FP32 state for the
   strict serving lane.
 
 ## Remaining Ada work
 
-1. Close the four W4 prefill red cells without weakening its accuracy lane.
-2. Narrow the FP32-state versus FP16-state prefill cost while retaining exact
+1. Narrow the FP32-state versus FP16-state prefill cost while retaining exact
    cold/warm cache continuation.
-3. Close the Albatross end-to-end projection/norm/fusion gap.
-4. Run batch sizes 1/2/4 and the 2.9B/7.2B models.
-5. Produce raw JSONL with committed repository SHAs and rerun matched Qwen3.5
-   and Albatross baselines under the final acceptance environment.
+2. Close the Albatross end-to-end projection/norm/fusion gap.
+3. Run batch sizes 1/2/4 and the 2.9B/7.2B models.
+4. Rerun matched Qwen3.5 and Albatross baselines under the final acceptance
+   environment.

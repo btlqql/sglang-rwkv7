@@ -114,9 +114,11 @@ python -m sglang.launch_server \
   --max-running-requests 16
 ```
 
-The W4 accuracy policy keeps attention and edge FFN layers dense while
-quantizing both FFN projections in middle layers. Group size 128 is the
-supported online Marlin setting in the validated environment.
+The W4 accuracy policy keeps attention and edge FFN layers dense. In the
+middle stack it interleaves W4 Marlin and W8A8 FFN blocks. This hybrid keeps a
+substantial W4 memory/decode benefit while avoiding Marlin's large-batch
+prefill regression. `balanced` and `speed` remain pure-W4 policies. Group size
+128 is the supported online Marlin setting in the validated environment.
 
 ## Quantized alignment
 
