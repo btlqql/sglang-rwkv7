@@ -1,11 +1,16 @@
 """Numerical parity tests for the native RWKV-7 Triton kernels."""
 
+import os
 import unittest
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.layers.attention.rwkv7_kernels import wkv_recurrent
+from sglang.srt.layers.attention.rwkv7_kernels import (
+    token_shift_packed_varlen,
+    wkv_recurrent,
+)
 from sglang.srt.layers.attention.rwkv7_kernels.fused import (
     fused_gate_corr,
     fused_kk_kmix,
@@ -103,12 +108,13 @@ class TestRwkv7Kernels(unittest.TestCase):
         )
         cu_seqlens = torch.tensor([0, 1, 4, total], device="cuda", dtype=torch.int64)
 
-        actual_o, actual_state = wkv_recurrent(
-            *inputs,
-            initial_state=initial,
-            output_final_state=True,
-            cu_seqlens=cu_seqlens,
-        )
+        with patch.dict(os.environ, {"SGLANG_RWKV7_FAST_FP16_PREFILL": "1"}):
+            actual_o, actual_state = wkv_recurrent(
+                *inputs,
+                initial_state=initial,
+                output_final_state=True,
+                cu_seqlens=cu_seqlens,
+            )
 
         expected_outputs = []
         expected_states = []
@@ -123,6 +129,97 @@ class TestRwkv7Kernels(unittest.TestCase):
 
         expected_o = torch.cat(expected_outputs).unsqueeze(0)
         expected_state = torch.stack(expected_states)
+        torch.testing.assert_close(actual_o, expected_o, rtol=0.02, atol=0.02)
+        torch.testing.assert_close(actual_state, expected_state, rtol=2e-5, atol=2e-5)
+
+    def test_fp16_indexed_varlen_state_matches_published_recurrence(self):
+        lengths = [3, 0, 5]
+        total = sum(lengths)
+        scale = self.head_dim**-0.5
+        inputs = tuple(tensor.to(torch.float16) for tensor in self._inputs(1, total))
+        state_pool = (
+            torch.randn(
+                7,
+                self.heads,
+                self.head_dim,
+                self.head_dim,
+                device="cuda",
+                dtype=torch.float16,
+            )
+            * 0.02
+        )
+        original_pool = state_pool.clone()
+        cache_indices = torch.tensor([2, -1, 5], device="cuda", dtype=torch.int32)
+        cu_seqlens = torch.tensor([0, 3, 3, total], device="cuda", dtype=torch.int32)
+
+        actual_o, returned_state = wkv_recurrent(
+            *inputs,
+            scale=scale,
+            state_pool=state_pool,
+            cache_indices=cache_indices,
+            cu_seqlens=cu_seqlens,
+        )
+        self.assertIsNone(returned_state)
+
+        expected_outputs = []
+        start = 0
+        for length, slot in ((3, 2), (5, 5)):
+            expected_o, expected_state = _reference_sequence(
+                *(x[0, start : start + length] for x in inputs),
+                original_pool[slot],
+                scale=scale,
+            )
+            expected_outputs.append(expected_o)
+            torch.testing.assert_close(
+                state_pool[slot].float(), expected_state, rtol=0.01, atol=0.002
+            )
+            start += length
+
+        torch.testing.assert_close(
+            actual_o,
+            torch.cat(expected_outputs).unsqueeze(0),
+            rtol=0.03,
+            atol=0.001,
+        )
+        untouched = [index for index in range(len(state_pool)) if index not in (2, 5)]
+        torch.testing.assert_close(state_pool[untouched], original_pool[untouched])
+
+    def test_fp16_fast_prefill_matches_published_recurrence(self):
+        lengths = [3, 5]
+        total = sum(lengths)
+        inputs = tuple(tensor.to(torch.float16) for tensor in self._inputs(1, total))
+        initial = (
+            torch.randn(
+                len(lengths),
+                self.heads,
+                self.head_dim,
+                self.head_dim,
+                device="cuda",
+                dtype=torch.float32,
+            )
+            * 0.02
+        )
+        cu_seqlens = torch.tensor(
+            [0, lengths[0], total], device="cuda", dtype=torch.int32
+        )
+
+        actual_o, actual_state = wkv_recurrent(
+            *inputs,
+            initial_state=initial,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+        )
+        expected = []
+        start = 0
+        for index, length in enumerate(lengths):
+            expected.append(
+                _reference_sequence(
+                    *(x[0, start : start + length] for x in inputs), initial[index]
+                )
+            )
+            start += length
+        expected_o = torch.cat([item[0] for item in expected]).unsqueeze(0)
+        expected_state = torch.stack([item[1] for item in expected])
         torch.testing.assert_close(actual_o, expected_o, rtol=0.02, atol=0.02)
         torch.testing.assert_close(actual_state, expected_state, rtol=2e-5, atol=2e-5)
 
@@ -160,6 +257,74 @@ class TestRwkv7Kernels(unittest.TestCase):
 
         untouched = [index for index in range(len(state_pool)) if index not in (2, 5)]
         torch.testing.assert_close(state_pool[untouched], original_pool[untouched])
+
+    def test_indexed_varlen_ignores_zero_length_graph_slots(self):
+        lengths = [3, 0, 2, 0]
+        inputs = self._inputs(1, sum(lengths))
+        state_pool = (
+            torch.randn(
+                8,
+                self.heads,
+                self.head_dim,
+                self.head_dim,
+                device="cuda",
+                dtype=torch.float32,
+            )
+            * 0.02
+        )
+        original_pool = state_pool.clone()
+        cache_indices = torch.tensor([2, -1, 5, -1], device="cuda", dtype=torch.int32)
+        cu_seqlens = torch.tensor([0, 3, 3, 5, 5], device="cuda", dtype=torch.int32)
+
+        actual_o, returned_state = wkv_recurrent(
+            *inputs,
+            state_pool=state_pool,
+            cache_indices=cache_indices,
+            cu_seqlens=cu_seqlens,
+        )
+        self.assertIsNone(returned_state)
+
+        expected_outputs = []
+        start = 0
+        for length, slot in ((3, 2), (2, 5)):
+            expected_o, expected_state = _reference_sequence(
+                *(x[0, start : start + length] for x in inputs), original_pool[slot]
+            )
+            expected_outputs.append(expected_o)
+            torch.testing.assert_close(
+                state_pool[slot], expected_state, rtol=2e-5, atol=2e-5
+            )
+            start += length
+
+        torch.testing.assert_close(
+            actual_o,
+            torch.cat(expected_outputs).unsqueeze(0),
+            rtol=0.02,
+            atol=0.02,
+        )
+        untouched = [index for index in range(len(state_pool)) if index not in (2, 5)]
+        torch.testing.assert_close(state_pool[untouched], original_pool[untouched])
+
+    def test_token_shift_masks_zero_length_graph_slots(self):
+        token_count, hidden = 5, 128
+        x = torch.randn(token_count, hidden, device="cuda", dtype=self.dtype)
+        conv = torch.randn(8, hidden, 1, device="cuda", dtype=torch.float32)
+        original_conv = conv.clone()
+        query_start_loc = torch.tensor(
+            [0, 3, 3, 5, 5], device="cuda", dtype=torch.int32
+        )
+        cache_indices = torch.tensor([2, -1, 5, -1], device="cuda", dtype=torch.int32)
+
+        actual = token_shift_packed_varlen(x, conv, query_start_loc, cache_indices)
+        expected = torch.empty_like(x)
+        expected[1:] = x[:-1]
+        expected[0] = original_conv[2, :, 0].to(x.dtype)
+        expected[3] = original_conv[5, :, 0].to(x.dtype)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(conv[2, :, 0], x[2].float(), rtol=0, atol=0)
+        torch.testing.assert_close(conv[5, :, 0], x[4].float(), rtol=0, atol=0)
+        untouched = [index for index in range(len(conv)) if index not in (2, 5)]
+        torch.testing.assert_close(conv[untouched], original_conv[untouched])
 
     def test_speculative_snapshots_do_not_advance_persistent_state(self):
         batch, length = 3, 4

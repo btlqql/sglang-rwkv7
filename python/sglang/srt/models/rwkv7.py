@@ -8,13 +8,12 @@ the WKV recurrence runs in a dedicated Triton kernel (via Rwkv7AttnBackend). Mod
 parameter names mirror the fla-format checkpoint so `load_weights` uses
 `default_weight_loader` with no remapping.
 
-Quantization: the linear projections (r/k/v/o_proj, ffn key/value) and the
-LoRA down/up projections are sglang quant-aware `ReplicatedLinear` (tp=1) threaded
-with `quant_config`. With `quant_config=None` they are unquantized `F.linear`
-(bit-identical to the previous `nn.Linear`, so greedy stays EXACT); quantized
-configs carry their quantized weights through the same modules. The WKV
-recurrence/state and the small per-channel params (x_*, k_k, k_a, r_k, g_norm)
-are never quantized — they stay bf16/fp32.
+Quantization: the large r/k/v/o_proj and FFN key/value projections are SGLang
+quant-aware linears. RWKV-specific accuracy/balanced/speed policies choose
+which of those projections are quantized. Online W8/W4 and BitsAndBytes keep
+low-rank controls and lm_head dense because their small or poorly shaped GEMMs
+add error/latency for little memory benefit. The WKV recurrence/state and
+per-channel parameters (x_*, k_k, k_a, r_k, g_norm) are never weight-quantized.
 
 Tensor parallelism is head-parallel: head_dim stays whole and whole heads are
 split across ranks (r/k/v + LoRA-up column-parallel with no gather, per-channel
@@ -47,6 +46,7 @@ Channel-mix (ffn): shifted=prev(x); xk = x + x_k·(shifted-x); out = value(relu(
 """
 
 import logging
+import os
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
@@ -117,6 +117,77 @@ def _tp_rank() -> int:
 
 # e^-0.5 = 1/sqrt(e); w_log = -this * sigmoid(w_raw)  =>  decay = exp(w_log).
 _INV_SQRT_E = 0.6065306597126334
+
+
+def _rwkv7_w8_policy() -> str:
+    """Select the model-specific online W8A8 accuracy/compression trade-off."""
+    policy = os.getenv("SGLANG_RWKV7_W8_POLICY", "accuracy").lower()
+    if policy not in ("accuracy", "balanced", "speed"):
+        raise ValueError(
+            "SGLANG_RWKV7_W8_POLICY must be accuracy, balanced, or speed; "
+            f"got {policy!r}."
+        )
+    return policy
+
+
+def _rwkv7_w4_policy() -> str:
+    """Select the model-specific online Marlin accuracy/compression trade-off."""
+    policy = os.getenv("SGLANG_RWKV7_W4_POLICY", "accuracy").lower()
+    if policy not in ("accuracy", "balanced", "speed"):
+        raise ValueError(
+            "SGLANG_RWKV7_W4_POLICY must be accuracy, balanced, or speed; "
+            f"got {policy!r}."
+        )
+    return policy
+
+
+def _rwkv7_projection_quant_config(
+    quant_config: Optional[QuantizationConfig],
+    projection: str,
+    layer_id: Optional[int] = None,
+    num_hidden_layers: Optional[int] = None,
+) -> Optional[QuantizationConfig]:
+    """Apply RWKV-specific mixed-precision policy to large projections.
+
+    ``projection`` is one of ``attention``, ``ffn_key``, or ``ffn_value``.
+    The speed policies quantize every large projection. Balanced policies keep
+    recurrent attention dense. Accuracy policies additionally protect the W8
+    sqReLU expansion and the most sensitive edge FFN layers.
+    """
+    if quant_config is None:
+        return None
+    if projection not in ("attention", "ffn_key", "ffn_value"):
+        raise ValueError(f"Unknown RWKV-7 projection class: {projection!r}")
+
+    name = quant_config.get_name()
+    if name == "w8a8_int8":
+        policy = _rwkv7_w8_policy()
+        if policy == "speed":
+            return quant_config
+        if projection == "attention":
+            return None
+        if policy == "accuracy" and projection == "ffn_key":
+            return None
+        if policy == "accuracy" and projection == "ffn_value":
+            if layer_id is None or num_hidden_layers is None:
+                raise ValueError("FFN value policy requires layer metadata")
+            if layer_id in (0, num_hidden_layers - 1):
+                return None
+
+    if name == "marlin":
+        policy = _rwkv7_w4_policy()
+        if policy == "speed":
+            return quant_config
+        if projection == "attention":
+            return None
+        if policy == "accuracy":
+            if layer_id is None or num_hidden_layers is None:
+                raise ValueError("W4 accuracy policy requires layer metadata")
+            edge_layers = min(4, max(1, num_hidden_layers // 6))
+            if layer_id < edge_layers or layer_id >= num_hidden_layers - edge_layers:
+                return None
+
+    return quant_config
 
 
 def _make_proj(
@@ -279,12 +350,35 @@ class Rwkv7Attention(nn.Module):
         self.x_a = nn.Parameter(torch.zeros(1, 1, H))
         self.x_g = nn.Parameter(torch.zeros(1, 1, H))
 
+        # Dynamic W8A8 activation quantization inside the recurrent time-mix
+        # compounds its error through the persistent state. Keep these four
+        # attention projections in the activation dtype for the accuracy lane;
+        # the larger FFN key/value matrices still use INT8 and retain most of
+        # the memory/throughput benefit. Weight-only W4 avoids activation
+        # quantization, but its accuracy policy also keeps recurrent attention
+        # dense because these projections feed the persistent state.
+        attention_quant_config = _rwkv7_projection_quant_config(
+            quant_config,
+            "attention",
+            layer_id=layer_id,
+            num_hidden_layers=config.num_hidden_layers,
+        )
         # Projections are quant-aware ReplicatedLinear (tp=1) / parallel linears (tp>1).
-        self.r_proj = _make_proj(H, H, quant_config, add_prefix("r_proj", prefix))
-        self.k_proj = _make_proj(H, H, quant_config, add_prefix("k_proj", prefix))
-        self.v_proj = _make_proj(H, H, quant_config, add_prefix("v_proj", prefix))
+        self.r_proj = _make_proj(
+            H, H, attention_quant_config, add_prefix("r_proj", prefix)
+        )
+        self.k_proj = _make_proj(
+            H, H, attention_quant_config, add_prefix("k_proj", prefix)
+        )
+        self.v_proj = _make_proj(
+            H, H, attention_quant_config, add_prefix("v_proj", prefix)
+        )
         self.o_proj = _make_proj(
-            H, H, quant_config, add_prefix("o_proj", prefix), parallel="row"
+            H,
+            H,
+            attention_quant_config,
+            add_prefix("o_proj", prefix),
+            parallel="row",
         )
 
         low_rank_quant_config = quant_config
@@ -454,11 +548,32 @@ class Rwkv7FeedForward(nn.Module):
         self.hidden_size = H
         inter = config.intermediate_size
         self.x_k = nn.Parameter(torch.zeros(H))
+        # W8A8 on the expansion projection perturbs values before sqReLU,
+        # which squares that activation error. Keep ``key`` dense and quantize
+        # the equally large contraction projection (``value``); this is the
+        # conservative W8 accuracy lane. W4 quantizes both FFN projections in
+        # middle layers while its accuracy policy protects edge layers.
+        key_quant_config = _rwkv7_projection_quant_config(
+            quant_config,
+            "ffn_key",
+            layer_id=layer_id,
+            num_hidden_layers=config.num_hidden_layers,
+        )
         # tp>1: key is column-parallel (local inter slice; sqrelu is elementwise so
         # it acts per-slice), value is row-parallel (allreduce restores the full H).
-        self.key = _make_proj(H, inter, quant_config, add_prefix("key", prefix))
+        self.key = _make_proj(H, inter, key_quant_config, add_prefix("key", prefix))
+        value_quant_config = _rwkv7_projection_quant_config(
+            quant_config,
+            "ffn_value",
+            layer_id=layer_id,
+            num_hidden_layers=config.num_hidden_layers,
+        )
         self.value = _make_proj(
-            inter, H, quant_config, add_prefix("value", prefix), parallel="row"
+            inter,
+            H,
+            value_quant_config,
+            add_prefix("value", prefix),
+            parallel="row",
         )
 
     def forward(self, forward_batch: ForwardBatch, x: torch.Tensor) -> torch.Tensor:
@@ -657,12 +772,24 @@ class Rwkv7ForCausalLM(nn.Module):
         self.model = Rwkv7Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
+        # Keep the vocabulary projection in the activation dtype for online
+        # weight conversion. Its logits are especially sensitive to coarse
+        # per-channel quantization, while retaining it costs little relative
+        # to the six large projections in every RWKV block. This also matches
+        # the usual AWQ/GPTQ policy of leaving lm_head unquantized.
+        lm_head_quant_config = quant_config
+        if quant_config is not None and quant_config.get_name() in (
+            "bitsandbytes",
+            "marlin",
+            "w8a8_int8",
+        ):
+            lm_head_quant_config = None
         # lm_head exists on every pp rank (llama pattern; only the last rank uses
         # it — the logits_processor runs there).
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
-            quant_config=quant_config,
+            quant_config=lm_head_quant_config,
             org_num_embeddings=config.vocab_size,
             prefix=add_prefix("lm_head", prefix),
         )

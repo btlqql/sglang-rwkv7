@@ -3,24 +3,28 @@
 ## Primary objective
 
 Treat `RWKV7_HF_PARITY.md` as the acceptance contract. The SGLang RWKV-7
-inference path must match or exceed every applicable inference feature and
-performance path in `rwkv-rs/hf-adapter`, then retain SGLang-specific serving
-advantages.
+inference path must follow the workload, correctness, quantization, metric, and
+hardware rules maintained in `rwkv-rs/hf-adapter`. Performance promotion is
+decided against matched Qwen3.5 and Albatross baselines, not by comparing the
+SGLang server to the Hugging Face runtime. SGLang-specific serving advantages
+must remain enabled and correct.
 
 ## Source of truth
 
-- Record the exact HF adapter commit for every comparison.
+- Record the exact HF adapter commit that defines every acceptance run.
 - The initial pinned baseline is
   `f1b49bc52a050d09a6739bc4859850f5dc50e7ef`.
 - Mathematical correctness is checked against the HF adapter and official
-  RWKV-7 behavior; serving behavior is checked through SGLang end to end.
+  RWKV-7 behavior. Qwen3.5 is the matched-activation speed baseline and
+  Albatross is the same-checkpoint RWKV speed baseline. Serving behavior is
+  checked through SGLang end to end.
 - Do not copy experimental defaults blindly. Reuse algorithms and kernel ideas,
   but adapt layouts to SGLang state pools, scheduler metadata, CUDA Graph
   buffers, tensor parallelism, and pipeline parallelism.
 
 ## Engineering priorities
 
-1. Matched HF/SGLang benchmark harness and red-cell analyzer.
+1. HF-standard benchmark harness with Qwen3.5/Albatross red-cell analysis.
 2. Fused dense decode and graph replay.
 3. Fixed-shape and chunked/DPLR prefill.
 4. Native W8 speed and memory policies.
@@ -40,7 +44,8 @@ Python wrapper layers.
 - No regression at batch sizes 1, 2, 4, and 8.
 - Prefill, decode, TTFT, TPOT, throughput, footprint, active state memory,
   configured pool memory, and peak VRAM are all reported.
-- W8/W4 must reduce memory and be no slower than dense and matched HF quant.
+- W8/W4 must reduce memory and be no slower than the SGLang dense path. Their
+  accuracy policy follows the HF acceptance standard.
 - Dynamic batching, chunked prefill, state-cache cold/warm equality, and slot
   reuse remain correct.
 - GPU-specific defaults require an exact-device result; all other devices retain

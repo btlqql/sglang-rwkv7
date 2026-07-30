@@ -160,18 +160,36 @@ if _use_aiter:
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
 
+_has_sgl_kernel_fp8 = False
 if _is_cuda:
-    from sgl_kernel import fp8_scaled_mm
+    try:
+        from sgl_kernel import fp8_scaled_mm
+
+        _has_sgl_kernel_fp8 = True
+    except (ImportError, OSError) as exc:
+        # fp8_utils is imported by dense communication paths as well as FP8
+        # quantizers. A missing or architecture-mismatched optional kernel
+        # wheel must not prevent an unquantized model from starting. FP8 GEMMs
+        # continue through the Triton/torch fallbacks selected below.
+        logger.warning(
+            "sgl-kernel FP8 GEMM is unavailable (%s); using portable FP8 fallbacks.",
+            exc,
+        )
 
     from sglang.kernels.ops.gemm.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 
-    @register_fake_if_exists("sgl_kernel::fp8_scaled_mm")
-    def _fp8_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
-        # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite layout; output is [M, N].
-        M = mat_a.shape[-2]
-        N = mat_b.shape[-1]
-        return mat_a.new_empty((M, N), dtype=out_dtype)
+    if _has_sgl_kernel_fp8:
+
+        @register_fake_if_exists("sgl_kernel::fp8_scaled_mm")
+        def _fp8_scaled_mm_abstract(
+            mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None
+        ):
+            # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite
+            # layout; output is [M, N].
+            M = mat_a.shape[-2]
+            N = mat_b.shape[-1]
+            return mat_a.new_empty((M, N), dtype=out_dtype)
 
     from flashinfer import bmm_fp8 as _raw_bmm_fp8_batched
 
@@ -226,7 +244,7 @@ USE_ROWWISE_TORCH_SCALED_MM = use_rowwise_torch_scaled_mm()
 
 @lru_cache(maxsize=1)
 def cutlass_fp8_supported():
-    if not _is_cuda:
+    if not _is_cuda or not _has_sgl_kernel_fp8:
         return False
     major, minor = get_device_capability()
     cuda_version = get_cuda_version()
@@ -1057,9 +1075,9 @@ def _pack_mxfp8_scales(scale_u8: torch.Tensor) -> torch.Tensor:
     assert scale_u8.dim() == 2, f"Expected 2D scale tensor, got {scale_u8.dim()}D"
     scale_u8 = scale_u8.contiguous()
     m, k_groups = scale_u8.shape
-    assert (
-        k_groups % 4 == 0
-    ), f"{k_groups=} must be divisible by 4 (K must be multiple of 128)"
+    assert k_groups % 4 == 0, (
+        f"{k_groups=} must be divisible by 4 (K must be multiple of 128)"
+    )
 
     scale_m = ceil_div(m, 128)
     if m % 128 != 0:
@@ -1522,9 +1540,9 @@ def quant_weight_ue8m0(
     weight_block_size: List[int],
 ):
     assert weight_block_size == [128, 128]
-    assert (
-        weight_dequant.dtype == torch.bfloat16
-    ), f"{weight_dequant.dtype=} {weight_dequant.shape=}"
+    assert weight_dequant.dtype == torch.bfloat16, (
+        f"{weight_dequant.dtype=} {weight_dequant.shape=}"
+    )
 
     *batch_dims, n, k = weight_dequant.shape
 
@@ -1611,9 +1629,9 @@ def inverse_transform_scale_ue8m0(sf_packed, mn):
     sf_fp32 = _inverse_transform_scale_ue8m0_impl(sf_packed)
     # Can call consistency check every time since this is only called on startup
     sf_packed_recreated = transform_scale_ue8m0(sf_fp32, mn=mn, use_torch_impl=True)
-    assert torch.all(
-        sf_packed == sf_packed_recreated
-    ), f"{sf_packed=} {sf_packed_recreated=} {sf_fp32=}"
+    assert torch.all(sf_packed == sf_packed_recreated), (
+        f"{sf_packed=} {sf_packed_recreated=} {sf_fp32=}"
+    )
     return sf_fp32
 
 

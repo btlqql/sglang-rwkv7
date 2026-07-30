@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -49,6 +51,42 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner = self._make_runner()
 
         self.assertTrue(runner.can_run_graph(self._make_forward_batch(8)))
+
+    def test_full_graph_metadata_uses_static_extend_start_loc(self):
+        captured = {}
+
+        class Backend:
+            def init_forward_metadata_out_graph(self, forward_batch):
+                captured["forward_batch"] = forward_batch
+
+        runner = self._make_runner()
+        runner._is_full_backend = True
+        runner._capture_req_slots = 4
+        runner._full_cg_seq_lens_cpu = torch.zeros(4, dtype=torch.int64)
+        runner._prefill_static_buffers = {
+            "seq_lens": torch.tensor([8, 4, 0, 0]),
+            "req_pool_indices": torch.tensor([3, 7, 0, 0]),
+            "extend_seq_lens": torch.tensor([3, 2, 0, 0]),
+            "extend_prefix_lens": torch.tensor([5, 2, 0, 0]),
+            "extend_start_loc": torch.tensor([0, 3, 5, 5]),
+        }
+        runner.model_runner = SimpleNamespace(attn_backend=Backend())
+        forward_batch = SimpleNamespace(
+            batch_size=2,
+            seq_lens_cpu=torch.tensor([8, 4], dtype=torch.int64),
+        )
+
+        runner._prepare_forward_metadata_for_replay(
+            forward_batch, static_forward_batch=SimpleNamespace(), num_tokens=16
+        )
+
+        padded = captured["forward_batch"]
+        self.assertEqual(padded.batch_size, 4)
+        self.assertEqual(padded.extend_start_loc.tolist(), [0, 3, 5, 5])
+        self.assertEqual(
+            padded.extend_start_loc.data_ptr(),
+            runner._prefill_static_buffers["extend_start_loc"].data_ptr(),
+        )
 
 
 if __name__ == "__main__":

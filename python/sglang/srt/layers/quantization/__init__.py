@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import builtins
 import inspect
+import logging
 from typing import TYPE_CHECKING, Dict, Optional, Type
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 # Define empty classes as placeholders when vllm is not available
@@ -40,6 +43,25 @@ _legacy_cuda = _cuda_compute_capability is not None and _cuda_compute_capability
     5,
 )
 
+# A dense model must still be able to start when the optional kernel wheel is
+# absent or when a wheel for the wrong CUDA/SM variant was installed. Importing
+# several quantizer modules eagerly imports ``sgl_kernel``; a loader error there
+# used to abort model-config construction before quantization was even selected.
+# Keep BitsAndBytes and the unquantized path available, and expose native kernel
+# quantizers only after the extension has proved loadable on the current GPU.
+_sgl_kernel_available = True
+if is_cuda() and not _legacy_cuda:
+    try:
+        import sgl_kernel as _sgl_kernel  # noqa: F401
+    except (ImportError, OSError) as exc:
+        _sgl_kernel_available = False
+        logger.warning(
+            "Native sgl-kernel quantizers are unavailable (%s). Dense and "
+            "BitsAndBytes model loading remain enabled; install the matching "
+            "sglang-kernel CUDA/SM wheel to enable native quantization.",
+            exc,
+        )
+
 # Current sgl-kernel wheels start at SM75. Importing quantizers backed by that
 # package on Pascal/Volta fails before an unquantized or BitsAndBytes model can
 # even be constructed. Keep the legacy registry intentionally small; unsupported
@@ -56,7 +78,7 @@ W4AFp8Config = W8A8Fp8Config = W8A8Int8Config = DummyConfig
 
 from sglang.srt.layers.quantization.bitsandbytes import BitsAndBytesConfig
 
-if not _legacy_cuda:
+if not _legacy_cuda and (not is_cuda() or _sgl_kernel_available):
     from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
     from sglang.srt.layers.quantization.awq import (
         AWQConfig,
@@ -134,7 +156,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "mxfp_w4a8": Mxfp4W4A8Config,
 }
 
-if _legacy_cuda:
+if _legacy_cuda or (is_cuda() and not _sgl_kernel_available):
     BASE_QUANTIZATION_METHODS = {
         name: config
         for name, config in BASE_QUANTIZATION_METHODS.items()
@@ -142,7 +164,11 @@ if _legacy_cuda:
     }
 
 
-if is_cpu() or (is_cuda() and not _legacy_cuda) or (_is_mxfp_supported and is_hip()):
+if (
+    is_cpu()
+    or (is_cuda() and not _legacy_cuda and _sgl_kernel_available)
+    or (_is_mxfp_supported and is_hip())
+):
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,
