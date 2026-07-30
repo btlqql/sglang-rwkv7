@@ -1,0 +1,15 @@
+{
+  "date": "2026-07-30",
+  "gpu": "NVIDIA GeForce RTX 4080",
+  "compute_capability": "8.9",
+  "driver": "595.71.05",
+  "python": "3.12.2",
+  "pytorch": "2.11.0+cu130",
+  "torch_cuda": "13.0",
+  "triton": "3.6.0",
+  "transformers": "5.8.0",
+  "sglang_kernel": "0.4.5+cu130 (SM89 wheel)",
+  "sglang_repo_sha": "a590b2ac9ef1dcbd22a605b1cc109d96fbfe7dbf",
+  "hf_acceptance_sha": "f1b49bc52a050d09a6739bc4859850f5dc50e7ef",
+  "scope": "RWKV-7 G1 1.5B, batch 8 engineering snapshot"
+}

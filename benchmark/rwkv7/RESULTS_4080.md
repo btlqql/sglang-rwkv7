@@ -8,6 +8,9 @@ RWKV-7 1.5B checkpoint, batch size 8, and one RTX 4080. It is an engineering
 snapshot, not a claim that the 216-cell, multi-model, or multi-hardware matrix
 is complete.
 
+Raw per-run JSONL and the public environment manifest are stored under
+[`results/2026-07-30/rtx-4080`](results/2026-07-30/rtx-4080/).
+
 ## Workload
 
 - model: RWKV-7 G1 1.5B;
