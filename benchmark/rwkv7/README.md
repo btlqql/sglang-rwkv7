@@ -76,8 +76,15 @@ python -m sglang.launch_server \
   --cuda-graph-max-bs-decode 8 \
   --max-running-requests 16 \
   --cuda-graph-config \
-  '{"decode":{"backend":"full","bs":[1,2,4,8]},"prefill":{"backend":"full","bs":[1024,4096,16384],"full_prefill_max_req":8}}'
+  '{"decode":{"backend":"full","bs":[1,2,4,8]},"prefill":{"backend":"full","bs":[128,256,512,1024,2048,4096,8192,16384],"full_prefill_max_req":8}}'
 ```
+
+The prefill capture list is the set of distinct aggregate token counts in the
+HF matrix (`batch_size * prompt_length`). Omitting the 128/256/512/2048/8192
+buckets pads several bsz 1/2/4 cells into a larger graph and can nearly halve
+reported throughput. Full-prefill graphs are currently an explicit fixed-shape
+performance lane; dynamic shapes, chunked requests, and uncaptured sizes retain
+their normal fallback paths.
 
 `--mamba-ssm-dtype float16` selects the Ada FP16-state performance lane and its
 optional native packed-varlen CUDA WKV kernel. It lowers state memory and raises

@@ -4,7 +4,7 @@ Date: 2026-07-31
 
 This page records the current Ada optimization slice. It is intentionally
 narrower than the full acceptance contract in `RWKV7_HF_PARITY.md`: one
-RWKV-7 1.5B checkpoint, batch size 8, and one RTX 4080. It is an engineering
+RWKV-7 1.5B checkpoint, batch sizes 1/2/4/8, and one RTX 4080. It is an engineering
 snapshot, not a claim that the 216-cell, multi-model, or multi-hardware matrix
 is complete.
 
@@ -18,14 +18,15 @@ strict FP32-state evidence remains under `results/2026-07-30/rtx-4080`.
 - model: RWKV-7 G1 1.5B;
 - device: NVIDIA GeForce RTX 4080, 16 GB;
 - activation dtype: FP16;
-- batch size: 8;
+- batch sizes: 1, 2, 4, and 8;
 - prompt lengths per request: 128, 512, and 2048 tokens;
 - decode lengths per request: 128 and 512 tokens;
 - greedy decoding with EOS ignored;
 - recurrent radix cache flushed before each sample;
 - two warm-ups and the median of five measured samples;
 - full CUDA Graph decode at batch sizes 1/2/4/8;
-- fixed-shape full-prefill CUDA Graph buckets at 1024/4096/16384 packed tokens.
+- fixed-shape full-prefill CUDA Graph buckets at
+  128/256/512/1024/2048/4096/8192/16384 packed tokens.
 
 `prefill tok/s` counts all input tokens until every request has emitted its
 first token. `decode tok/s` counts aggregate output tokens after that first
@@ -62,6 +63,18 @@ This lane uses `--mamba-ssm-dtype float16` and the native packed-varlen CUDA WKV
 kernel. It is the fastest measured configuration, but FP16 recurrent state is
 an explicit performance/precision choice rather than the strict default.
 
+The exact aggregate-token graph buckets close the padding loss in the smaller
+active batches. Across all 24 cells, the minimum ratios against the matched
+dense lane are:
+
+| Mode | Prefill / dense | Decode / dense | E2E / dense |
+| --- | ---: | ---: | ---: |
+| W8 accuracy | 1.048x | 1.053x | 1.054x |
+| W4 hybrid accuracy | 1.023x | 1.139x | 1.127x |
+
+The table below retains the batch-8 absolute values; raw batch-1/2/4 rows are
+published beside it under the result directory.
+
 | Prompt | Decode | Mode | Prefill tok/s | Decode tok/s | E2E tok/s | Prefill / dense | Decode / dense | E2E / dense |
 | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | 128 | 128 | dense | 22,913.6 | 1,140.6 | 1,094.8 | 1.000x | 1.000x | 1.000x |
@@ -83,7 +96,7 @@ an explicit performance/precision choice rather than the strict default.
 | 2048 | 512 | W8 accuracy | 29,462.0 | 1,257.4 | 1,075.2 | 1.135x | 1.084x | 1.091x |
 | 2048 | 512 | W4 hybrid accuracy | 27,452.1 | 1,335.3 | 1,119.4 | 1.057x | 1.151x | 1.136x |
 
-Current result:
+Batch-8 result:
 
 - W8 accuracy is faster than dense in all 18 measured prefill/decode/E2E gates.
   Its minimum gains are 12.9% prefill, 6.8% decode, and 6.8% end to end.
@@ -142,9 +155,9 @@ llama.cpp-quality quantization parity.
   are recorded as the requested engineering acceptance comparison rather than
   a claim of identical API overhead.
 - The existing HF-derived Qwen3.5 batch-8 speed gate was green in these six
-  dense cells. This SGLang checkout does not yet implement
-  `Qwen3_5ForConditionalGeneration`, so a same-runtime SGLang Qwen rerun is
-  still missing and no final cross-runtime claim is made here.
+  dense cells. The same-runtime SGLang Qwen3.5 rerun is still in progress. Its
+  hybrid attention path does not support the RWKV-specific full-prefill graph,
+  so the matched production baseline uses eager prefill and full decode graphs.
 
 ## Serving and graph validation
 
@@ -163,7 +176,8 @@ llama.cpp-quality quantization parity.
 
 1. Narrow the FP32-state versus FP16-state prefill cost while retaining exact
    cold/warm cache continuation.
-2. Extend the now-green B8 W8/Albatross slice to dense and W4 prefill.
-3. Run batch sizes 1/2/4 and the 2.9B/7.2B models.
+2. Extend the now-green batch-1/2/4/8 quant-vs-dense slice to every Albatross
+   and Qwen3.5 gate.
+3. Complete the running 2.9B/7.2B model matrices.
 4. Run same-runtime Qwen3.5 and larger-model Albatross baselines under the
    final acceptance environment.
