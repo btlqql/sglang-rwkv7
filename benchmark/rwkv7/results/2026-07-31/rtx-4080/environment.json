@@ -9,7 +9,8 @@
   "triton": "3.6.0",
   "transformers": "5.8.0",
   "sglang_kernel": "0.4.5+cu130",
-  "sglang_repo_sha": "a51d446a15bee9d8dd65c7e9d146e1afbf22c022",
+  "sglang_repo_sha": "74c196347c2956e78d185fd0bf5dc78ddaaa502e",
   "hf_acceptance_sha": "f1b49bc52a050d09a6739bc4859850f5dc50e7ef",
-  "scope": "RWKV-7 G1 1.5B, batch 8, matched dense/W8/W4-hybrid acceptance rerun"
+  "scope": "RWKV-7 G1 1.5B, batch 8, matched dense/W8/W4-hybrid rerun plus matched Albatross fixed-shape baseline",
+  "albatross_sha": "343147a333fcd6dd0845de0d165089685402c012"
 }

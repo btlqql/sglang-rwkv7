@@ -24,7 +24,9 @@
 > [RWKV-7 serving benchmark](benchmark/rwkv7/README.md). The current measured
 > Ada slice is published separately as the
 > [RTX 4080 engineering snapshot](benchmark/rwkv7/RESULTS_4080.md), including
-> its remaining red cells and precision caveats.
+> its remaining red cells and precision caveats. The current 1.5B/B8 W8 lane
+> exceeds the matched Albatross T=1/128/512/2048 throughput while W8 and W4 are
+> faster than dense in every published serving cell.
 
 <p align="center">
 <a href="https://lmsys.org/blog/"><b>Blog</b></a> |

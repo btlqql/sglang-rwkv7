@@ -11,18 +11,18 @@
   },
   "passed": true,
   "summary": {
-    "max_token_logprob_error": 0.4668281078338623,
-    "mean_token_logprob_error": 0.051794857528566496,
-    "mean_top_k_overlap": 0.9,
+    "max_token_logprob_error": 0.46182751655578613,
+    "mean_token_logprob_error": 0.05373986590644009,
+    "mean_top_k_overlap": 0.8953125,
     "teacher_forced_top1_agreement": 0.9921875
   },
   "results": [
     {
       "prompt": "The capital of France is",
       "tokens": 32,
-      "max_token_logprob_error": 0.21900629997253418,
-      "mean_token_logprob_error": 0.03294164674480271,
-      "mean_top_k_overlap": 0.921875,
+      "max_token_logprob_error": 0.24686920642852783,
+      "mean_token_logprob_error": 0.03299166799524755,
+      "mean_top_k_overlap": 0.9125,
       "teacher_forced_top1_agreement": 1.0,
       "free_running_matching_prefix": 32,
       "free_running_exact": true
@@ -30,9 +30,9 @@
     {
       "prompt": "1 + 2 + 3 + 4 + 5 =",
       "tokens": 32,
-      "max_token_logprob_error": 0.4668281078338623,
-      "mean_token_logprob_error": 0.06895190974773868,
-      "mean_top_k_overlap": 0.909375,
+      "max_token_logprob_error": 0.46182751655578613,
+      "mean_token_logprob_error": 0.07116829061669705,
+      "mean_top_k_overlap": 0.9125,
       "teacher_forced_top1_agreement": 0.96875,
       "free_running_matching_prefix": 5,
       "free_running_exact": false
@@ -40,9 +40,9 @@
     {
       "prompt": "Once upon a time, in a small village by the sea,",
       "tokens": 32,
-      "max_token_logprob_error": 0.26134663820266724,
-      "mean_token_logprob_error": 0.07209692905566101,
-      "mean_top_k_overlap": 0.921875,
+      "max_token_logprob_error": 0.20671340823173523,
+      "mean_token_logprob_error": 0.07272851256358592,
+      "mean_top_k_overlap": 0.915625,
       "teacher_forced_top1_agreement": 1.0,
       "free_running_matching_prefix": 32,
       "free_running_exact": true
@@ -50,9 +50,9 @@
     {
       "prompt": "The quick brown fox",
       "tokens": 32,
-      "max_token_logprob_error": 0.20428621768951416,
-      "mean_token_logprob_error": 0.03318894456606358,
-      "mean_top_k_overlap": 0.846875,
+      "max_token_logprob_error": 0.19391942024230957,
+      "mean_token_logprob_error": 0.038070992450229824,
+      "mean_top_k_overlap": 0.8406250000000001,
       "teacher_forced_top1_agreement": 1.0,
       "free_running_matching_prefix": 32,
       "free_running_exact": true

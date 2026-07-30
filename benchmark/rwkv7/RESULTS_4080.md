@@ -64,30 +64,31 @@ an explicit performance/precision choice rather than the strict default.
 
 | Prompt | Decode | Mode | Prefill tok/s | Decode tok/s | E2E tok/s | Prefill / dense | Decode / dense | E2E / dense |
 | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 128 | 128 | dense | 23,545.4 | 1,105.6 | 1,063.9 | 1.000x | 1.000x | 1.000x |
-| 128 | 128 | W8 accuracy | 26,849.0 | 1,181.9 | 1,140.7 | 1.140x | 1.069x | 1.072x |
-| 128 | 128 | W4 hybrid accuracy | 25,690.6 | 1,258.4 | 1,208.1 | 1.091x | 1.138x | 1.136x |
-| 128 | 512 | dense | 23,875.8 | 1,114.3 | 1,103.5 | 1.000x | 1.000x | 1.000x |
-| 128 | 512 | W8 accuracy | 28,088.8 | 1,202.3 | 1,191.9 | 1.176x | 1.079x | 1.080x |
-| 128 | 512 | W4 hybrid accuracy | 25,689.8 | 1,259.0 | 1,246.2 | 1.076x | 1.130x | 1.129x |
-| 512 | 128 | dense | 26,499.1 | 1,112.4 | 958.9 | 1.000x | 1.000x | 1.000x |
-| 512 | 128 | W8 accuracy | 31,075.3 | 1,198.3 | 1,045.1 | 1.173x | 1.077x | 1.090x |
-| 512 | 128 | W4 hybrid accuracy | 28,961.6 | 1,269.9 | 1,087.6 | 1.093x | 1.142x | 1.134x |
-| 512 | 512 | dense | 26,415.4 | 1,113.1 | 1,070.0 | 1.000x | 1.000x | 1.000x |
-| 512 | 512 | W8 accuracy | 31,013.5 | 1,197.5 | 1,154.9 | 1.174x | 1.076x | 1.079x |
-| 512 | 512 | W4 hybrid accuracy | 29,278.8 | 1,275.2 | 1,223.9 | 1.108x | 1.146x | 1.144x |
-| 2048 | 128 | dense | 25,106.3 | 1,112.8 | 654.0 | 1.000x | 1.000x | 1.000x |
-| 2048 | 128 | W8 accuracy | 28,237.3 | 1,199.3 | 716.4 | 1.125x | 1.078x | 1.095x |
-| 2048 | 128 | W4 hybrid accuracy | 27,158.9 | 1,283.3 | 733.8 | 1.082x | 1.153x | 1.122x |
-| 2048 | 512 | dense | 25,066.0 | 1,113.2 | 946.8 | 1.000x | 1.000x | 1.000x |
-| 2048 | 512 | W8 accuracy | 28,231.6 | 1,199.0 | 1,026.6 | 1.126x | 1.077x | 1.084x |
-| 2048 | 512 | W4 hybrid accuracy | 27,155.4 | 1,280.1 | 1,078.4 | 1.083x | 1.150x | 1.139x |
+| 128 | 128 | dense | 22,913.6 | 1,140.6 | 1,094.8 | 1.000x | 1.000x | 1.000x |
+| 128 | 128 | W8 accuracy | 27,005.4 | 1,234.3 | 1,189.3 | 1.179x | 1.082x | 1.086x |
+| 128 | 128 | W4 hybrid accuracy | 25,160.3 | 1,323.9 | 1,267.1 | 1.098x | 1.161x | 1.157x |
+| 128 | 512 | dense | 24,080.0 | 1,157.9 | 1,146.3 | 1.000x | 1.000x | 1.000x |
+| 128 | 512 | W8 accuracy | 27,174.5 | 1,236.3 | 1,224.8 | 1.129x | 1.068x | 1.068x |
+| 128 | 512 | W4 hybrid accuracy | 25,112.4 | 1,324.2 | 1,309.2 | 1.043x | 1.144x | 1.142x |
+| 512 | 128 | dense | 27,093.6 | 1,157.5 | 995.1 | 1.000x | 1.000x | 1.000x |
+| 512 | 128 | W8 accuracy | 31,065.4 | 1,245.4 | 1,080.6 | 1.147x | 1.076x | 1.086x |
+| 512 | 128 | W4 hybrid accuracy | 27,937.9 | 1,327.7 | 1,124.0 | 1.031x | 1.147x | 1.129x |
+| 512 | 512 | dense | 27,166.6 | 1,160.6 | 1,114.8 | 1.000x | 1.000x | 1.000x |
+| 512 | 512 | W8 accuracy | 31,452.7 | 1,252.4 | 1,206.8 | 1.158x | 1.079x | 1.083x |
+| 512 | 512 | W4 hybrid accuracy | 27,793.2 | 1,322.9 | 1,265.1 | 1.023x | 1.140x | 1.135x |
+| 2048 | 128 | dense | 25,960.1 | 1,159.9 | 679.5 | 1.000x | 1.000x | 1.000x |
+| 2048 | 128 | W8 accuracy | 29,439.0 | 1,257.2 | 749.9 | 1.134x | 1.084x | 1.104x |
+| 2048 | 128 | W4 hybrid accuracy | 28,125.2 | 1,346.2 | 765.7 | 1.083x | 1.161x | 1.127x |
+| 2048 | 512 | dense | 25,968.8 | 1,159.9 | 985.7 | 1.000x | 1.000x | 1.000x |
+| 2048 | 512 | W8 accuracy | 29,462.0 | 1,257.4 | 1,075.2 | 1.135x | 1.084x | 1.091x |
+| 2048 | 512 | W4 hybrid accuracy | 27,452.1 | 1,335.3 | 1,119.4 | 1.057x | 1.151x | 1.136x |
 
 Current result:
 
 - W8 accuracy is faster than dense in all 18 measured prefill/decode/E2E gates.
+  Its minimum gains are 12.9% prefill, 6.8% decode, and 6.8% end to end.
 - W4 hybrid accuracy is also faster in all 18 gates. Its minimum gains are
-  7.6% prefill, 13.0% decode, and 12.2% end to end.
+  2.3% prefill, 14.0% decode, and 12.7% end to end.
 
 ## Prior strict FP32-state W8 lane
 
@@ -120,8 +121,8 @@ quantization error.
 
 | Mode | Max chosen-token logprob error | Mean error | Mean top-10 overlap | Teacher-forced top-1 agreement | Gate |
 | --- | ---: | ---: | ---: | ---: | --- |
-| W8 accuracy | 0.1025 | 0.0156 | 0.9664 | 1.0000 | pass (`0.25 / 0.80 / 0.90`) |
-| W4 hybrid accuracy | 0.4668 | 0.0518 | 0.9000 | 0.9922 | pass (`1.00 / 0.80 / 0.90`) |
+| W8 accuracy | 0.1012 | 0.0166 | 0.9625 | 1.0000 | pass (`0.25 / 0.80 / 0.90`) |
+| W4 hybrid accuracy | 0.4618 | 0.0537 | 0.8953 | 0.9922 | pass (`1.00 / 0.80 / 0.90`) |
 
 W8 reproduced all four 32-token natural-prompt continuations in the measured
 FP16-state run. W4 hybrid reproduced three of four. Long synthetic free-running
@@ -132,10 +133,14 @@ llama.cpp-quality quantization parity.
 
 - The isolated native FP16-state WKV kernel measured 11-15% faster than the
   matched Albatross WKV microkernel for sequence lengths 128/512/2048.
-- The prior end-to-end dense run was approximately 0.827-0.875x Albatross
-  prefill and 0.941-0.951x Albatross decode. The new fused ReLU2 path improves
-  dense prefill, but the matched Albatross rerun is still pending; no updated
-  end-to-end Albatross ratio is inferred from unmatched measurements.
+- The matched Albatross commit `343147a` measured B8 throughput of 1,173.1
+  tok/s at T=1, 25,705.0 at T=128, 29,076.1 at T=512, and 29,309.1 at T=2048.
+- W8 accuracy exceeds those fixed-shape baselines in every matched B8 cell:
+  decode is 1.052-1.072x, T=128 prefill is 1.051-1.057x, T=512 is
+  1.068-1.082x, and T=2048 is 1.004-1.005x. SGLang serving and Albatross's
+  fixed-forward harness have different outer timing semantics, so these ratios
+  are recorded as the requested engineering acceptance comparison rather than
+  a claim of identical API overhead.
 - The existing HF-derived Qwen3.5 batch-8 speed gate was green in these six
   dense cells. This SGLang checkout does not yet implement
   `Qwen3_5ForConditionalGeneration`, so a same-runtime SGLang Qwen rerun is
@@ -158,7 +163,7 @@ llama.cpp-quality quantization parity.
 
 1. Narrow the FP32-state versus FP16-state prefill cost while retaining exact
    cold/warm cache continuation.
-2. Close the Albatross end-to-end projection/norm/fusion gap.
+2. Extend the now-green B8 W8/Albatross slice to dense and W4 prefill.
 3. Run batch sizes 1/2/4 and the 2.9B/7.2B models.
-4. Rerun matched Qwen3.5 and Albatross baselines under the final acceptance
-   environment.
+4. Run same-runtime Qwen3.5 and larger-model Albatross baselines under the
+   final acceptance environment.

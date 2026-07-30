@@ -64,6 +64,12 @@ fallback.
 additional experimental FP16 prefill fast path. It is opt-in because long
 free-running generation can amplify the reduction-order difference.
 
+The low-precision serving path automatically fuses token shift with the six
+time-mix streams and fuses per-head GroupNorm with recurrent correction and
+the output gate. The FP32 lane retains the strict ATen path. Promotion requires
+the kernel tolerance tests plus the dense/quantized logit and greedy gates; no
+environment switch is needed for the promoted fusions.
+
 ## Quantized servers
 
 RWKV-7 applies model-specific mixed-precision policies to online W8 and W4.

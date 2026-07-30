@@ -61,12 +61,12 @@ Parity is complete only when all of the following are true:
 | Split recurrent prefill scan | Add card-specific scan layouts and autotuning for sequence mode | Partial |
 | DPLR/chunked prefill | Implement the long-sequence path and preserve exact chunk-to-decode state handoff | Recurrent chunking functional and FP32-state exact; DPLR scan missing |
 | Fused projection/LoRA experiments | Port only deeper fusions that beat vendor GEMM end to end; do not promote isolated slower kernels | Missing |
-| Fused FFN experiments | Keep cuBLAS/vendor GEMM unless a larger graph/layer fusion wins on serving workloads | Fused ReLU2 promoted; projection/activation fusion remains open |
+| Fused serving boundaries | Keep vendor GEMM and fuse profitable memory-bound boundaries around it | ReLU2, token-shift/time-mix, and GroupNorm/recurrent-output/gate fusions promoted; projection fusion remains open |
 | Native W8 speed policy | Add packed/fused projection kernels and card policy; footprint must fall and all-phase speed must pass | Accuracy/balanced/speed policy implemented; Ada 1.5B B8 six-cell speed slice green for FP16 and strict FP32 state |
 | Native W4 speed policy | Use Marlin/TorchAO/custom packed kernels as appropriate and select by measured card/shape policy | Hybrid accuracy plus pure-W4 balanced/speed policies implemented; Ada 1.5B B8 matched dense/W4 six-cell prefill/decode/E2E slice green |
 | W8/W4 memory policy | Retain a maximum-compression lane separately from the speed lane | Accuracy and compression lanes exist; BitsAndBytes remains the legacy fallback |
 | SM70 projection/FFN policy | Match the HF V100 fast path without assuming tensor-core features unavailable on Volta | Partial |
-| Ada fixed-shape and quant policy | Pass the HF-defined Qwen3.5/Albatross and W8/W4 matrices independently on 4080 and 4090 | 4080 1.5B B8 matched dense/W8/W4 slice is green; remaining batches/models, matched external baselines, and all 4090 cells are open |
+| Ada fixed-shape and quant policy | Pass the HF-defined Qwen3.5/Albatross and W8/W4 matrices independently on 4080 and 4090 | 4080 1.5B B8 dense/W8/W4-vs-dense slice is green and W8 exceeds matched Albatross at T=1/128/512/2048; remaining batches/models, same-runtime Qwen, dense/W4 Albatross prefill, and all 4090 cells are open |
 | Blackwell quant matrix | Run the HF-defined 5090 216-cell matrix and close every Qwen3.5/Albatross red cell | Missing |
 | Apple MLX/Metal performance | Track as an explicit backend/bridge deliverable rather than silently excluding it | Missing |
 | ROCm/AMD policy | Provide HIP-compatible recurrence, dense, and quantized paths with real AMD results | Missing |
