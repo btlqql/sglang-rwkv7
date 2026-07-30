@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-
 FLOAT_RE = r"[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?\d+)?"
 ALBATROSS_RESULT_RE = re.compile(
     r"RESULT\s+B=(?P<batch>\d+)\s+T=(?P<tokens>\d+)\s+"
