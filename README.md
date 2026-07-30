@@ -12,6 +12,15 @@
 
 --------------------------------------------------------------------------------
 
+> **RWKV-7 distribution.** This repository maintains a production-oriented
+> RWKV-7 serving path on top of SGLang. The acceptance target is full inference
+> feature and performance parity with the
+> [RWKV-7 Hugging Face adapter](https://github.com/rwkv-rs/hf-adapter), followed
+> by serving-specific gains from continuous batching, recurrent radix caching,
+> chunked prefill, distributed execution, and speculative decoding. See the
+> [HF parity contract](RWKV7_HF_PARITY.md) and
+> [RWKV-7 serving benchmark](benchmark/rwkv7/README.md).
+
 <p align="center">
 <a href="https://lmsys.org/blog/"><b>Blog</b></a> |
 <a href="https://docs.sglang.io/"><b>Documentation</b></a> |
