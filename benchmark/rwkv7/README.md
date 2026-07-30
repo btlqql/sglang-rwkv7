@@ -34,6 +34,32 @@ The full contract covers 1.5B/2.9B/7.2B and dense/W8/W4, for 216 cells per
 hardware target. `--no-flush-cache` is diagnostic only; acceptance runs flush
 the recurrent radix cache before every sample.
 
+`analyze_acceptance_matrix.py` joins candidate rows to matched Qwen3.5 JSONL
+and raw Albatross `RESULT` logs. It keeps missing candidate and baseline cells
+in the denominator and can fail CI when any required speed gate is red:
+
+```bash
+python benchmark/rwkv7/analyze_acceptance_matrix.py \
+  --candidate results/rwkv-dense.jsonl \
+  --candidate results/rwkv-w8.jsonl \
+  --candidate results/rwkv-w4.jsonl \
+  --qwen rwkv7-g1-1.5b=results/qwen3.5-2b.jsonl \
+  --qwen rwkv7-g1-2.9b=results/qwen3.5-4b.jsonl \
+  --qwen rwkv7-g1-7.2b=results/qwen3.5-9b.jsonl \
+  --albatross rwkv7-g1-1.5b=results/albatross-1.5b.log \
+  --albatross rwkv7-g1-2.9b=results/albatross-2.9b.log \
+  --albatross rwkv7-g1-7.2b=results/albatross-7.2b.log \
+  --active-work-factor rwkv7-g1-1.5b=1.0 \
+  --active-work-minimum rwkv7-g1-1.5b=1.75 \
+  --require-active-work --strict \
+  --output results/acceptance-report.json
+```
+
+Active-work factors and thresholds are explicit inputs so a model-pair change
+cannot silently alter the rule. Albatross has no HTTP serving boundary, so its
+fixed-forward rows gate prefill and decode only; Qwen JSONL gates TTFT, TPOT,
+E2E, prefill, and decode in the same serving API.
+
 ## Dense server
 
 The strict state-cache lane keeps recurrent state in FP32:
