@@ -8,11 +8,14 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.attention.rwkv7_kernels import (
+    token_shift_lerp6_decode,
+    token_shift_lerp6_packed_varlen,
     token_shift_packed_varlen,
     wkv_recurrent,
 )
 from sglang.srt.layers.attention.rwkv7_kernels.fused import (
     fused_gate_corr,
+    fused_groupnorm_gate_corr,
     fused_kk_kmix,
     fused_lerp6,
 )
@@ -326,6 +329,42 @@ class TestRwkv7Kernels(unittest.TestCase):
         untouched = [index for index in range(len(conv)) if index not in (2, 5)]
         torch.testing.assert_close(conv[untouched], original_conv[untouched])
 
+    def test_fused_token_shift_lerp6_packed_is_bit_exact(self):
+        token_count, hidden = 5, 128
+        x = torch.randn(token_count, hidden, device="cuda", dtype=self.dtype)
+        mix = torch.randn(6, hidden, device="cuda", dtype=self.dtype)
+        conv = torch.randn(8, hidden, 1, device="cuda", dtype=torch.float32)
+        reference_conv = conv.clone()
+        query_start_loc = torch.tensor(
+            [0, 3, 3, 5, 5], device="cuda", dtype=torch.int32
+        )
+        cache_indices = torch.tensor([2, -1, 5, -1], device="cuda", dtype=torch.int32)
+
+        shifted = token_shift_packed_varlen(
+            x, reference_conv, query_start_loc, cache_indices
+        )
+        expected = fused_lerp6(x, shifted, mix)
+        actual = token_shift_lerp6_packed_varlen(
+            x, conv, mix, query_start_loc, cache_indices
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(conv, reference_conv, rtol=0, atol=0)
+
+    def test_fused_token_shift_lerp6_decode_is_bit_exact(self):
+        batch, hidden = 4, 128
+        x = torch.randn(batch, hidden, device="cuda", dtype=self.dtype)
+        mix = torch.randn(6, hidden, device="cuda", dtype=self.dtype)
+        conv = torch.randn(8, hidden, 1, device="cuda", dtype=torch.float32)
+        reference_conv = conv.clone()
+        cache_indices = torch.tensor([2, 3, 5, 6], device="cuda", dtype=torch.int32)
+        shifted = reference_conv[cache_indices, :, 0].to(x.dtype)
+        reference_conv[cache_indices, :, 0] = x.to(reference_conv.dtype)
+        expected = fused_lerp6(x, shifted, mix)
+
+        actual = token_shift_lerp6_decode(x, conv, mix, cache_indices)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(conv, reference_conv, rtol=0, atol=0)
+
     def test_speculative_snapshots_do_not_advance_persistent_state(self):
         batch, length = 3, 4
         packed_inputs = self._inputs(1, batch * length)
@@ -423,6 +462,32 @@ class TestRwkv7Kernels(unittest.TestCase):
         expected = expected * g
         actual = fused_gate_corr(o_norm, r, k_head, r_k, v, g, heads)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+        norm = torch.nn.GroupNorm(heads, hidden, eps=64e-5, device="cuda").to(
+            self.dtype
+        )
+        raw_o = torch.randn_like(x)
+        expected_norm = norm(raw_o)
+        expected = expected_norm + ((r * k_head * r_k).sum(-1, keepdim=True) * v).view(
+            tokens, hidden
+        )
+        expected = expected * g
+        actual = fused_groupnorm_gate_corr(
+            raw_o,
+            r,
+            k_head,
+            r_k,
+            v,
+            g,
+            norm.weight,
+            norm.bias,
+            heads,
+            norm.eps,
+        )
+        # GroupNorm's reduction tree differs from ATen's implementation. The
+        # fused kernel remains within the same low-precision tolerance used by
+        # the recurrent kernel and is covered by the end-to-end logit gate.
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 if __name__ == "__main__":

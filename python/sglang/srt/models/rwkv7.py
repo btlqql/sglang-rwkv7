@@ -63,9 +63,8 @@ from sglang.srt.distributed.communication_op import (
 )
 from sglang.srt.layers.activation import ReLU2
 from sglang.srt.layers.attention.rwkv7_kernels.fused import (
-    fused_gate_corr,
+    fused_groupnorm_gate_corr,
     fused_kk_kmix,
-    fused_lerp6,
 )
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -482,14 +481,15 @@ class Rwkv7Attention(nn.Module):
         # Local (per-rank) head slice; == the full width at tp=1.
         H, hd, nh = self.local_hidden_size, self.head_dim, self.local_num_heads
 
-        # Fused triton elementwise path: bit-identical to the torch reference at
-        # bf16/fp16 (verified), so it stacks with cuda-graph + int8. fp32 keeps the
-        # original torch path (1-ULP reduction-order drift would risk the fp32 gate).
+        # Fused Triton serving path: the elementwise pieces are bit-identical at
+        # bf16/fp16; fused GroupNorm has a bounded reduction-order delta covered
+        # by end-to-end logit/greedy gates. fp32 keeps the strict torch path.
         fused = x.dtype != torch.float32
 
         if fused:
-            shifted = be.token_shift(x, self.layer_id, 0, forward_batch)
-            lp = fused_lerp6(x, shifted, self._mix6_buf())
+            lp = be.token_shift_lerp6(
+                x, self._mix6_buf(), self.layer_id, 0, forward_batch
+            )
             xr, xk, xw, xa, xg, xv = lp[0], lp[1], lp[2], lp[3], lp[4], lp[5]
         else:
             shifted = be.token_shift(x, self.layer_id, 0, forward_batch)
@@ -536,11 +536,22 @@ class Rwkv7Attention(nn.Module):
 
         o = be.recurrence(r, w_log, k, v, kk, a, self.layer_id, forward_batch)
         # o: [T, nh, hd]
-        o = self.g_norm(o.reshape(T, H))
         if fused:
-            # o = (g_norm(o) + (r*k*r_k).sum(-1)*v) * g   (one launch)
-            o = fused_gate_corr(o, r, k, self.r_k, v, g, nh)
+            # GroupNorm + recurrent correction + output gate (one launch).
+            o = fused_groupnorm_gate_corr(
+                o,
+                r,
+                k,
+                self.r_k,
+                v,
+                g,
+                self.g_norm.weight,
+                self.g_norm.bias,
+                nh,
+                self.g_norm.eps,
+            )
         else:
+            o = self.g_norm(o.reshape(T, H))
             gate_corr = ((r * k * self.r_k).sum(dim=-1, keepdim=True) * v).reshape(T, H)
             o = o + gate_corr
             o = o * g

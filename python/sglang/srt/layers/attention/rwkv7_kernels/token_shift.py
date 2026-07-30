@@ -16,6 +16,167 @@ import triton.language as tl
 
 
 @triton.jit
+def _store_lerp6(
+    x,
+    shifted,
+    mix_ptr,
+    out_ptr,
+    row,
+    hidden_offset,
+    hidden_size: tl.constexpr,
+    token_count,
+    mask,
+):
+    """Store six torch-order rounded lerps for one token/hidden tile."""
+    DT = out_ptr.dtype.element_ty
+    delta = (shifted - x).to(DT).to(tl.float32)
+    for i in tl.static_range(6):
+        mix = tl.load(
+            mix_ptr + i * hidden_size + hidden_offset,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        product = (mix * delta).to(DT).to(tl.float32)
+        value = (x + product).to(DT)
+        tl.store(
+            out_ptr + i * token_count * hidden_size + row + hidden_offset,
+            value,
+            mask=mask,
+        )
+
+
+@triton.jit
+def _token_shift_lerp6_adjacent_kernel(
+    x_ptr,
+    mix_ptr,
+    out_ptr,
+    token_count,
+    hidden_size: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Fast interior path; request starts are overwritten by the boundary kernel."""
+    token = tl.program_id(0) + 1
+    hidden_offset = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = hidden_offset < hidden_size
+    row = token * hidden_size
+    x = tl.load(x_ptr + row + hidden_offset, mask=mask, other=0.0).to(tl.float32)
+    shifted = tl.load(
+        x_ptr + row - hidden_size + hidden_offset, mask=mask, other=0.0
+    ).to(tl.float32)
+    _store_lerp6(
+        x,
+        shifted,
+        mix_ptr,
+        out_ptr,
+        row,
+        hidden_offset,
+        hidden_size,
+        token_count,
+        mask,
+    )
+
+
+@triton.jit
+def _token_shift_lerp6_boundaries_kernel(
+    x_ptr,
+    conv_ptr,
+    mix_ptr,
+    out_ptr,
+    query_start_loc_ptr,
+    cache_indices_ptr,
+    token_count,
+    hidden_size: tl.constexpr,
+    conv_slots,
+    conv_stride_slot: tl.constexpr,
+    conv_stride_h: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Patch request starts with cached state and persist each request's last row."""
+    request_index = tl.program_id(0)
+    hidden_offset = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+
+    start = tl.load(query_start_loc_ptr + request_index).to(tl.int64)
+    end = tl.load(query_start_loc_ptr + request_index + 1).to(tl.int64)
+    cache_index = tl.load(cache_indices_ptr + request_index).to(tl.int64)
+    valid_request = (
+        (end > start)
+        & (start >= 0)
+        & (end <= token_count)
+        & (cache_index >= 0)
+        & (cache_index < conv_slots)
+    )
+    mask = valid_request & (hidden_offset < hidden_size)
+    row = start * hidden_size
+    conv_offset = cache_index * conv_stride_slot + hidden_offset * conv_stride_h
+    x = tl.load(x_ptr + row + hidden_offset, mask=mask, other=0.0).to(tl.float32)
+    # token_shift returns the fp32 cache converted to x.dtype before lerp.
+    DT = out_ptr.dtype.element_ty
+    shifted = (
+        tl.load(conv_ptr + conv_offset, mask=mask, other=0.0).to(DT).to(tl.float32)
+    )
+    _store_lerp6(
+        x,
+        shifted,
+        mix_ptr,
+        out_ptr,
+        row,
+        hidden_offset,
+        hidden_size,
+        token_count,
+        mask,
+    )
+
+    last = tl.load(
+        x_ptr + (end - 1) * hidden_size + hidden_offset,
+        mask=mask,
+        other=0.0,
+    )
+    tl.store(conv_ptr + conv_offset, last, mask=mask)
+
+
+@triton.jit
+def _token_shift_lerp6_decode_kernel(
+    x_ptr,
+    conv_ptr,
+    mix_ptr,
+    out_ptr,
+    cache_indices_ptr,
+    token_count,
+    hidden_size: tl.constexpr,
+    conv_slots,
+    conv_stride_slot: tl.constexpr,
+    conv_stride_h: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    request_index = tl.program_id(0)
+    hidden_offset = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = hidden_offset < hidden_size
+    raw_cache_index = tl.load(cache_indices_ptr + request_index)
+    valid_cache = (raw_cache_index >= 0) & (raw_cache_index < conv_slots)
+    cache_index = tl.maximum(raw_cache_index, 0).to(tl.int64)
+    row = request_index * hidden_size
+    conv_offset = cache_index * conv_stride_slot + hidden_offset * conv_stride_h
+    x = tl.load(x_ptr + row + hidden_offset, mask=mask, other=0.0).to(tl.float32)
+    # Match conv[index].to(x.dtype) in the unfused decode path.
+    DT = out_ptr.dtype.element_ty
+    shifted = (
+        tl.load(conv_ptr + conv_offset, mask=mask, other=0.0).to(DT).to(tl.float32)
+    )
+    _store_lerp6(
+        x,
+        shifted,
+        mix_ptr,
+        out_ptr,
+        row,
+        hidden_offset,
+        hidden_size,
+        token_count,
+        mask,
+    )
+    tl.store(conv_ptr + conv_offset, x, mask=mask & valid_cache)
+
+
+@triton.jit
 def _token_shift_boundaries_kernel(
     x_ptr,
     shifted_ptr,
@@ -114,3 +275,112 @@ def token_shift_packed_varlen(
         num_warps=4,
     )
     return shifted
+
+
+def token_shift_lerp6_packed_varlen(
+    x: torch.Tensor,
+    conv: torch.Tensor,
+    mix6: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Fuse packed token shift, six time mixes, and boundary-state updates.
+
+    Interior tokens read the preceding normalized row directly. A second small
+    launch replaces every request boundary with its cached previous row and
+    writes the request's final normalized row back to the state pool. This
+    removes the full-size ``shifted`` tensor and its extra global-memory pass.
+    """
+    if x.ndim != 2:
+        raise ValueError(f"x must have shape [T, D], got {tuple(x.shape)}")
+    if conv.ndim != 3 or conv.shape[-1] != 1:
+        raise ValueError(f"conv must have shape [S, D, 1], got {tuple(conv.shape)}")
+    if mix6.shape != (6, x.shape[1]):
+        raise ValueError(
+            f"mix6 must have shape [6, {x.shape[1]}], got {tuple(mix6.shape)}"
+        )
+    if query_start_loc.numel() != cache_indices.numel() + 1:
+        raise ValueError(
+            "query_start_loc must have exactly one more entry than cache_indices"
+        )
+    if x.shape[1] != conv.shape[1]:
+        raise ValueError(f"hidden-size mismatch: x={x.shape[1]}, conv={conv.shape[1]}")
+
+    x, mix6 = x.contiguous(), mix6.contiguous()
+    out = torch.empty(6, *x.shape, dtype=x.dtype, device=x.device)
+    # Six output streams make this bandwidth-bound. A one-warp 128-channel
+    # tile gave the best occupancy across the measured packed prefill buckets.
+    block_h = 128
+    if x.shape[0] > 1:
+        _token_shift_lerp6_adjacent_kernel[
+            (x.shape[0] - 1, triton.cdiv(x.shape[1], block_h))
+        ](
+            x,
+            mix6,
+            out,
+            x.shape[0],
+            x.shape[1],
+            BLOCK_H=block_h,
+            num_warps=1,
+            enable_fp_fusion=False,
+        )
+    _token_shift_lerp6_boundaries_kernel[
+        (cache_indices.numel(), triton.cdiv(x.shape[1], block_h))
+    ](
+        x,
+        conv,
+        mix6,
+        out,
+        query_start_loc,
+        cache_indices,
+        x.shape[0],
+        x.shape[1],
+        conv.shape[0],
+        conv.stride(0),
+        conv.stride(1),
+        BLOCK_H=block_h,
+        num_warps=1,
+        enable_fp_fusion=False,
+    )
+    return out
+
+
+def token_shift_lerp6_decode(
+    x: torch.Tensor,
+    conv: torch.Tensor,
+    mix6: torch.Tensor,
+    cache_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Fuse the one-token-per-request shift/state update with six time mixes."""
+    if x.ndim != 2 or x.shape[0] != cache_indices.numel():
+        raise ValueError(
+            "decode x must be [batch, hidden] with one cache index per row; "
+            f"got x={tuple(x.shape)}, indices={cache_indices.numel()}"
+        )
+    if conv.ndim != 3 or conv.shape[-1] != 1 or conv.shape[1] != x.shape[1]:
+        raise ValueError(
+            f"conv must have shape [slots, {x.shape[1]}, 1], got {tuple(conv.shape)}"
+        )
+    if mix6.shape != (6, x.shape[1]):
+        raise ValueError(
+            f"mix6 must have shape [6, {x.shape[1]}], got {tuple(mix6.shape)}"
+        )
+    x, mix6 = x.contiguous(), mix6.contiguous()
+    out = torch.empty(6, *x.shape, dtype=x.dtype, device=x.device)
+    block_h = 256
+    _token_shift_lerp6_decode_kernel[(x.shape[0], triton.cdiv(x.shape[1], block_h))](
+        x,
+        conv,
+        mix6,
+        out,
+        cache_indices,
+        x.shape[0],
+        x.shape[1],
+        conv.shape[0],
+        conv.stride(0),
+        conv.stride(1),
+        BLOCK_H=block_h,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+    return out

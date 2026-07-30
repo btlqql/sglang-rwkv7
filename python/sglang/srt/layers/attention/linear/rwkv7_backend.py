@@ -33,9 +33,12 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 # (T==1) AND the extend/prefill (packed varlen via cu_seqlens) path, with no
 # dependency on the flash-linear-attention package.
 from sglang.srt.layers.attention.rwkv7_kernels import (
+    token_shift_lerp6_decode,
+    token_shift_lerp6_packed_varlen,
     token_shift_packed_varlen,
     wkv_recurrent,
 )
+from sglang.srt.layers.attention.rwkv7_kernels.fused import fused_lerp6
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -314,6 +317,41 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
         return token_shift_packed_varlen(
             x,
             conv,
+            md.query_start_loc,
+            cache_indices,
+        )
+
+    def token_shift_lerp6(
+        self,
+        x: torch.Tensor,
+        mix6: torch.Tensor,
+        layer_id: int,
+        conv_idx: int,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Fuse normal serving token shift/state update with six time mixes.
+
+        Speculative modes retain ``token_shift`` because their state protocol
+        writes acceptance-window scratch rather than the persistent state pool.
+        """
+        mode = forward_batch.forward_mode
+        if self.is_draft_worker or mode.is_draft_extend_v2() or mode.is_target_verify():
+            return fused_lerp6(
+                x,
+                self.token_shift(x, layer_id, conv_idx, forward_batch),
+                mix6,
+            )
+
+        cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        conv = cache.conv[conv_idx]
+        md = self.forward_metadata
+        cache_indices = md.mamba_cache_indices
+        if mode.is_decode_or_idle():
+            return token_shift_lerp6_decode(x, conv, mix6, cache_indices)
+        return token_shift_lerp6_packed_varlen(
+            x,
+            conv,
+            mix6,
             md.query_start_loc,
             cache_indices,
         )

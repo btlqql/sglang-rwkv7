@@ -7,24 +7,28 @@ elementwise "glue" spread across ~40 tiny CUDA kernels, plus 8 pathological tiny
 LoRA GEMVs (15.3%). These triton kernels collapse that glue into a handful of
 launches, lifting decode bandwidth utilization.
 
-BIT-EXACTNESS (the hard gate). The deployed reference computes everything in plain
-torch where every binary op on a low-precision tensor (bf16/fp16) rounds its result
-back to that dtype (`at::opmath_type<bf16> == float`, so compute-in-fp32 →
-round-to-bf16). We reproduce that EXACT rounding sequence: each sub-expression is
-evaluated in fp32 then immediately `.to(DT)` (round to the storage dtype) before
-being consumed by the next op. The single trick that makes this work for both bf16
-AND fp32 with one kernel: ``x.to(DT).to(tl.float32)`` where ``DT == float32`` is the
-identity (no precision change), while ``DT == bfloat16`` rounds.
+BIT-EXACTNESS (the hard gate for kernels A-C). The deployed reference computes
+everything in plain torch where every binary op on a low-precision tensor
+(bf16/fp16) rounds its result back to that dtype (`at::opmath_type<bf16> == float`,
+so compute-in-fp32 → round-to-bf16). Kernels A-C reproduce that EXACT rounding
+sequence: each sub-expression is evaluated in fp32 then immediately `.to(DT)`
+(round to the storage dtype) before being consumed by the next op. The single trick
+that makes this work for both bf16 AND fp32 with one kernel:
+``x.to(DT).to(tl.float32)`` where ``DT == float32`` is the identity (no precision
+change), while ``DT == bfloat16`` rounds.
 
 CRITICAL: every launch passes ``enable_fp_fusion=False`` (-> ptxas ``--fmad=false``).
 Without it triton/LLVM contracts ``x + m*d`` into one FMA and folds away the
 intermediate ``.to(DT)`` round, making the result ~1 ULP MORE accurate than torch --
 bit-DIFFERENT, which can flip a knife-edge bf16 argmax. With it the kernels are
 bit-identical to the torch reference (verified max_abs_diff == 0.0 at fp32/bf16/fp16).
-The hd-axis reductions (L2-norm, gate-correction sum) accumulate in fp32 exactly like
-torch's reductions; the final round-to-DT absorbs any reduction-order ULP. So the SAME
-kernels are bit-identical to the torch reference at fp32, bf16 and fp16 (verified
-max_abs_diff == 0.0, cuda graph on and off).
+The hd-axis reductions in kernels B-C accumulate in fp32 exactly like torch's
+reductions; the final round-to-DT absorbs any reduction-order ULP.
+
+Kernel D additionally folds ATen GroupNorm into kernel C. Its Triton reduction tree
+is not bit-identical to ATen GroupNorm, so it is used only by the low-precision
+serving lane and is guarded by kernel tolerance plus end-to-end logit/greedy gates.
+The fp32 correctness lane retains ATen GroupNorm and kernel C.
 
 All kernels are cuda-graph safe: static shapes, no host syncs, output into
 caller-allocated buffers.
@@ -240,6 +244,107 @@ def fused_gate_corr(o_norm, r, k, r_k, v, g, num_heads):
         H,
         num_heads,
         BK=BK,
+        enable_fp_fusion=False,
+    )
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Kernel D: per-head GroupNorm + gate-correction + output gate.
+# This removes the materialized GroupNorm output from the low-precision serving
+# path. Each RWKV head is exactly one GroupNorm group (normally 64 channels).
+# ----------------------------------------------------------------------------
+@triton.jit
+def _groupnorm_gate_corr_kernel(
+    o_ptr,
+    r_ptr,
+    k_ptr,
+    rk_ptr,
+    v_ptr,
+    g_ptr,
+    weight_ptr,
+    bias_ptr,
+    out_ptr,
+    T,
+    H,
+    NH,
+    EPS: tl.constexpr,
+    BK: tl.constexpr,
+):
+    t = tl.program_id(0)
+    h = tl.program_id(1)
+    j = tl.arange(0, BK)
+    HD = H // NH
+    mask = j < HD
+    DT = out_ptr.dtype.element_ty
+    base = t * H + h * HD + j
+    pbase = h * HD + j
+
+    raw = tl.load(o_ptr + base, mask=mask, other=0.0).to(tl.float32)
+    mean = tl.sum(tl.where(mask, raw, 0.0), axis=0) / HD
+    centered = tl.where(mask, raw - mean, 0.0)
+    variance = tl.sum(centered * centered, axis=0) / HD
+    weight = tl.load(weight_ptr + pbase, mask=mask, other=0.0).to(tl.float32)
+    bias = tl.load(bias_ptr + pbase, mask=mask, other=0.0).to(tl.float32)
+    # PyTorch's CUDA GroupNorm accumulates in fp32 and casts the affine result
+    # once to the input dtype.
+    o_norm = (centered * tl.rsqrt(variance + EPS) * weight + bias).to(DT)
+    o_norm = o_norm.to(tl.float32)
+
+    r = tl.load(r_ptr + base, mask=mask, other=0.0).to(tl.float32)
+    k = tl.load(k_ptr + base, mask=mask, other=0.0).to(tl.float32)
+    rk = tl.load(rk_ptr + pbase, mask=mask, other=0.0).to(tl.float32)
+    v = tl.load(v_ptr + base, mask=mask, other=0.0).to(tl.float32)
+    g = tl.load(g_ptr + base, mask=mask, other=0.0).to(tl.float32)
+    p1 = (r * k).to(DT).to(tl.float32)
+    p2 = (p1 * rk).to(DT).to(tl.float32)
+    corr_sum = tl.sum(tl.where(mask, p2, 0.0), axis=0)
+    corr_sum = corr_sum.to(DT).to(tl.float32)
+    correction = (corr_sum * v).to(DT).to(tl.float32)
+    result = (o_norm + correction).to(DT).to(tl.float32)
+    result = (result * g).to(DT)
+    tl.store(out_ptr + base, result, mask=mask)
+
+
+def fused_groupnorm_gate_corr(
+    o,
+    r,
+    k,
+    r_k,
+    v,
+    g,
+    weight,
+    bias,
+    num_heads,
+    eps,
+):
+    """Fuse RWKV per-head GroupNorm, recurrent correction, and output gate."""
+    T = o.shape[0]
+    H = o.numel() // T
+    HD = H // num_heads
+    BK = triton.next_power_of_2(HD)
+    o = o.reshape(T, H).contiguous()
+    r = r.reshape(T, H).contiguous()
+    k = k.reshape(T, H).contiguous()
+    v = v.reshape(T, H).contiguous()
+    g = g.reshape(T, H).contiguous()
+    out = torch.empty_like(o)
+    _groupnorm_gate_corr_kernel[(T, num_heads)](
+        o,
+        r,
+        k,
+        r_k.reshape(-1).contiguous(),
+        v,
+        g,
+        weight.reshape(-1).contiguous(),
+        bias.reshape(-1).contiguous(),
+        out,
+        T,
+        H,
+        num_heads,
+        EPS=float(eps),
+        BK=BK,
+        num_warps=1 if T <= 8 else 2,
         enable_fp_fusion=False,
     )
     return out
