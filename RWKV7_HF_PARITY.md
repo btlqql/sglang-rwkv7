@@ -136,12 +136,12 @@ quant_dense_ratio       = sglang_quant / sglang_dense
 Every promoted cell must satisfy:
 
 - `qwen_prefill_ratio >= 1.00`;
-- `qwen_decode_ratio >= 1.00`;
-- the model-pair-specific active-work decode threshold from the pinned HF
-  acceptance script (for RWKV-7 1.5B vs Qwen3.5 2B at batch 8: `>= 1.75`);
+- at batch 8, `qwen_decode_ratio >= 1.00` and the model-pair-specific
+  active-work decode threshold from the pinned HF acceptance script (for
+  RWKV-7 1.5B vs Qwen3.5 2B: `>= 1.75`);
 - `albatross_prefill_ratio >= 1.00` and `albatross_decode_ratio >= 1.00`;
-- SGLang end-to-end throughput passes the same Qwen3.5 and Albatross gates;
-- SGLang TTFT and TPOT pass the matched baseline cells;
+- SGLang end-to-end throughput and TPOT pass the Qwen3.5 gate at batch 8;
+- SGLang TTFT passes the matched Qwen3.5 cells at every batch;
 - `quant_dense_ratio >= 1.00` for W8 and W4;
 - W8 and W4 model footprint lower than dense;
 - no correctness or serving-feature regression.

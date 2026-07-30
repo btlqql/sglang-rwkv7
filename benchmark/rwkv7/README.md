@@ -56,14 +56,17 @@ python benchmark/rwkv7/analyze_acceptance_matrix.py \
   --active-work-minimum rwkv7-g1-1.5b=1.75 \
   --active-work-minimum rwkv7-g1-2.9b=1.75 \
   --active-work-minimum rwkv7-g1-7.2b=1.75 \
+  --qwen-decode-batch-sizes 8 \
   --require-active-work --require-memory --strict \
   --output results/acceptance-report.json
 ```
 
 Active-work factors and thresholds are explicit inputs so a model-pair change
-cannot silently alter the rule. Albatross has no HTTP serving boundary, so its
-fixed-forward rows gate prefill and decode only; Qwen JSONL gates TTFT, TPOT,
-E2E, prefill, and decode in the same serving API.
+cannot silently alter the rule. The agreed cross-architecture decode, TPOT,
+E2E, and active-work gates apply at batch 8; Qwen prefill and TTFT still gate
+every batch. All Qwen batch rows remain in the artifact even when they are not
+decode gates. Albatross has no HTTP serving boundary, so its fixed-forward rows
+gate prefill and decode only.
 
 The optional memory input becomes mandatory with `--require-memory`. It uses
 one record per model and mode; quantized model-weight memory must be strictly

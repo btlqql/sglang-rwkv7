@@ -110,6 +110,39 @@ class TestRwkv7AcceptanceReport(unittest.TestCase):
         self.assertEqual(report["summary"], {"passed": 0, "failed": 1, "missing": 1})
         self.assertIn("qwen_prefill_ratio", report["cells"][0]["failed_gates"])
 
+    def test_qwen_decode_gate_can_be_limited_to_batch_eight(self):
+        model = "rwkv7-g1-1.5b"
+        dense = row(model, "dense", prefill=200, decode=50, e2e=50)
+        qwen = row("qwen3.5-2b", "dense", prefill=100, decode=100, e2e=100)
+        albatross = {
+            (1, 1): {"tok_s_p50": 50},
+            (1, 128): {"tok_s_p50": 100},
+        }
+        report = REPORT.analyze(
+            candidate_rows=[dense],
+            qwen_rows={model: [qwen]},
+            albatross_rows={model: albatross},
+            models=[model],
+            modes=["dense"],
+            batch_sizes=[1],
+            prompt_lengths=[128],
+            decode_lengths=[128],
+            dense_mode="dense",
+            qwen_minimum=1.0,
+            albatross_minimum=1.0,
+            quant_minimum=1.0,
+            active_work_factors={},
+            active_work_minimums={},
+            require_active_work=True,
+            qwen_decode_batch_sizes={8},
+        )
+        self.assertTrue(report["passed"])
+        gates = report["cells"][0]["gates"]
+        self.assertIn("qwen_prefill_ratio", gates)
+        self.assertIn("qwen_ttft_ratio", gates)
+        self.assertNotIn("qwen_decode_ratio", gates)
+        self.assertNotIn("active_work_decode", gates)
+
     def test_jsonl_loader_rejects_wrong_schema(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "rows.jsonl"

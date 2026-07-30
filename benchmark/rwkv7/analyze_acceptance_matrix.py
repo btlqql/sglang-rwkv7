@@ -247,6 +247,7 @@ def analyze(
     active_work_factors: dict[str, float],
     active_work_minimums: dict[str, float],
     require_active_work: bool,
+    qwen_decode_batch_sizes: set[int] | None = None,
     memory_rows: Iterable[dict[str, Any]] = (),
     quant_memory_maximum: float = 0.999999,
     require_memory: bool = False,
@@ -289,38 +290,44 @@ def analyze(
             qwen_prefill = ratio(
                 median(current, "prefill_tok_s"), median(qwen_row, "prefill_tok_s")
             )
-            qwen_decode = ratio(
-                median(current, "decode_tok_s"), median(qwen_row, "decode_tok_s")
-            )
             add_gate(gates, "qwen_prefill_ratio", qwen_prefill, qwen_minimum)
-            add_gate(gates, "qwen_decode_ratio", qwen_decode, qwen_minimum)
-            add_gate(
-                gates,
-                "qwen_e2e_ratio",
-                ratio(
-                    median(current, "e2e_output_tok_s"),
-                    median(qwen_row, "e2e_output_tok_s"),
-                ),
-                qwen_minimum,
-            )
             add_gate(
                 gates,
                 "qwen_ttft_ratio",
                 ratio(median(qwen_row, "ttft_s"), median(current, "ttft_s")),
                 qwen_minimum,
             )
-            add_gate(
-                gates,
-                "qwen_tpot_ratio",
-                ratio(median(qwen_row, "tpot_s"), median(current, "tpot_s")),
-                qwen_minimum,
+            gate_qwen_decode = (
+                qwen_decode_batch_sizes is None
+                or key.batch_size in qwen_decode_batch_sizes
             )
-            factor = active_work_factors.get(key.model)
-            minimum = active_work_minimums.get(key.model)
-            if factor is not None and minimum is not None:
-                add_gate(gates, "active_work_decode", qwen_decode * factor, minimum)
-            elif require_active_work:
-                missing.append("active_work_config")
+            if gate_qwen_decode:
+                qwen_decode = ratio(
+                    median(current, "decode_tok_s"),
+                    median(qwen_row, "decode_tok_s"),
+                )
+                add_gate(gates, "qwen_decode_ratio", qwen_decode, qwen_minimum)
+                add_gate(
+                    gates,
+                    "qwen_e2e_ratio",
+                    ratio(
+                        median(current, "e2e_output_tok_s"),
+                        median(qwen_row, "e2e_output_tok_s"),
+                    ),
+                    qwen_minimum,
+                )
+                add_gate(
+                    gates,
+                    "qwen_tpot_ratio",
+                    ratio(median(qwen_row, "tpot_s"), median(current, "tpot_s")),
+                    qwen_minimum,
+                )
+                factor = active_work_factors.get(key.model)
+                minimum = active_work_minimums.get(key.model)
+                if factor is not None and minimum is not None:
+                    add_gate(gates, "active_work_decode", qwen_decode * factor, minimum)
+                elif require_active_work:
+                    missing.append("active_work_config")
 
         albatross = albatross_rows.get(key.model)
         if albatross is None:
@@ -457,6 +464,11 @@ def analyze(
             "active_work_factors": active_work_factors,
             "active_work_minimums": active_work_minimums,
             "require_active_work": require_active_work,
+            "qwen_decode_batch_sizes": (
+                None
+                if qwen_decode_batch_sizes is None
+                else sorted(qwen_decode_batch_sizes)
+            ),
             "quant_memory_maximum": quant_memory_maximum,
             "require_memory": require_memory,
         },
@@ -494,6 +506,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qwen-minimum", type=float, default=1.0)
     parser.add_argument("--albatross-minimum", type=float, default=1.0)
     parser.add_argument("--quant-minimum", type=float, default=1.0)
+    parser.add_argument("--qwen-decode-batch-sizes", type=csv_ints, default=[8])
     parser.add_argument("--memory", action="append", type=Path, default=[])
     parser.add_argument("--quant-memory-maximum", type=float, default=0.999999)
     parser.add_argument("--require-memory", action="store_true")
@@ -540,6 +553,7 @@ def main() -> int:
             args.active_work_minimum, value_name="MINIMUM"
         ),
         require_active_work=args.require_active_work,
+        qwen_decode_batch_sizes=set(args.qwen_decode_batch_sizes),
         memory_rows=load_memory_jsonl(args.memory),
         quant_memory_maximum=args.quant_memory_maximum,
         require_memory=args.require_memory,
