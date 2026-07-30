@@ -50,8 +50,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-top1-agreement", type=float, default=0.90)
     parser.add_argument("--timeout", type=float, default=300)
     parser.add_argument("--prompt", action="append", dest="prompts")
+    parser.add_argument(
+        "--reference-input",
+        type=Path,
+        help="Reuse a dense-HF reference generated in a separate process.",
+    )
+    parser.add_argument(
+        "--reference-output",
+        type=Path,
+        help="Persist the dense-HF continuation and logits for later scoring.",
+    )
+    parser.add_argument(
+        "--reference-only",
+        action="store_true",
+        help="Generate --reference-output without contacting an SGLang server.",
+    )
     parser.add_argument("--output", type=Path)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.reference_only and args.reference_output is None:
+        parser.error("--reference-only requires --reference-output")
+    if args.reference_only and args.reference_input is not None:
+        parser.error("--reference-only cannot be combined with --reference-input")
+    return args
 
 
 def load_hf_model(model_path: str, dtype: torch.dtype):
@@ -104,6 +124,55 @@ def build_references(args: argparse.Namespace) -> list[Reference]:
     del model
     gc.collect()
     torch.cuda.empty_cache()
+    return references
+
+
+def save_references(
+    path: Path, args: argparse.Namespace, references: list[Reference]
+) -> None:
+    payload = {
+        "schema": "rwkv7-quant-reference-v1",
+        "model": args.model,
+        "dtype": args.dtype,
+        "max_new_tokens": args.max_new_tokens,
+        "top_k": args.top_k,
+        "references": [reference.__dict__ for reference in references],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def load_references(path: Path, args: argparse.Namespace) -> list[Reference]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema") != "rwkv7-quant-reference-v1":
+        raise ValueError(
+            f"{path}: unsupported reference schema {payload.get('schema')!r}"
+        )
+    expected = {
+        "dtype": args.dtype,
+        "max_new_tokens": args.max_new_tokens,
+        "top_k": args.top_k,
+    }
+    mismatches = {
+        key: {"expected": value, "actual": payload.get(key)}
+        for key, value in expected.items()
+        if payload.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(f"{path}: reference configuration mismatch: {mismatches}")
+    references = [Reference(**row) for row in payload.get("references", [])]
+    if not references:
+        raise ValueError(f"{path}: reference set is empty")
+    for reference in references:
+        count = len(reference.output_ids)
+        if count != len(reference.token_logprobs) or count != len(reference.top_ids):
+            raise ValueError(
+                f"{path}: inconsistent reference lengths for prompt {reference.prompt!r}"
+            )
+        if any(len(ids) != args.top_k for ids in reference.top_ids):
+            raise ValueError(
+                f"{path}: top-k width mismatch for prompt {reference.prompt!r}"
+            )
     return references
 
 
@@ -187,7 +256,28 @@ def score_reference(
 
 def main() -> None:
     args = parse_args()
-    references = build_references(args)
+    if args.reference_input:
+        references = load_references(args.reference_input, args)
+    else:
+        references = build_references(args)
+    if args.reference_output:
+        save_references(args.reference_output, args, references)
+    if args.reference_only:
+        print(
+            json.dumps(
+                {
+                    "schema": "rwkv7-quant-reference-result-v1",
+                    "model": args.model,
+                    "reference_output": str(args.reference_output),
+                    "prompts": len(references),
+                    "tokens": sum(
+                        len(reference.output_ids) for reference in references
+                    ),
+                },
+                indent=2,
+            )
+        )
+        return
     results = [score_reference(args, reference) for reference in references]
     total_tokens = sum(int(row["tokens"]) for row in results)
     summary = {

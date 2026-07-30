@@ -180,6 +180,26 @@ overlap `>= 0.80`, and teacher-forced top-1 agreement `>= 0.90`. A W4 run may
 use a separately justified threshold, but a relaxed gate must be named in the
 result rather than silently replacing the W8 threshold.
 
+For a model whose dense reference and quantized server do not fit on one GPU,
+split reference generation and scoring into fresh processes:
+
+```bash
+# Dense server is stopped; only the HF model occupies the GPU.
+python benchmark/rwkv7/verify_quant_alignment.py \
+  --model /path/to/rwkv7-hf \
+  --reference-only \
+  --reference-output /tmp/rwkv7-7.2b-reference.json
+
+# Dense HF memory is released; start the quantized SGLang server, then score.
+python benchmark/rwkv7/verify_quant_alignment.py \
+  --model /path/to/rwkv7-hf \
+  --reference-input /tmp/rwkv7-7.2b-reference.json \
+  --base-url http://127.0.0.1:30000
+```
+
+The loader rejects reference files whose dtype, generation length, top-k
+width, or per-token array lengths do not match the requested scoring run.
+
 ## Serving-feature gate
 
 Run this against every promoted dense or quantized server:
