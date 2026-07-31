@@ -176,9 +176,9 @@ def _matmul_persistent_triton(
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
-    assert (
-        bias is None or bias.dim() == 1
-    ), "Currently assuming bias is 1D, let Horace know if you run into this"
+    assert bias is None or bias.dim() == 1, (
+        "Currently assuming bias is 1D, let Horace know if you run into this"
+    )
     NUM_SMS = get_device_core_count()
     M, K = a.shape
     K, N = b.shape
@@ -207,7 +207,11 @@ def _matmul_persistent_triton(
         },
         torch.float16: {
             "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 256,
+            # A 256-wide tile requires 106,496 bytes of shared memory in
+            # Triton, exceeding the 101,376-byte opt-in limit on Ada (SM89).
+            # The 128-wide tile keeps deterministic inference portable across
+            # Ampere/Ada while preserving the same reduction order.
+            "BLOCK_SIZE_N": 128,
             "BLOCK_SIZE_K": 64,
             "GROUP_SIZE_M": 8,
             "num_stages": 3,
@@ -501,9 +505,9 @@ def mean_dim(
     """
     # Validate inputs
     assert input.is_cuda or input.is_xpu, "Input must be a CUDA or XPU tensor"
-    assert (
-        -input.ndim <= dim < input.ndim
-    ), f"Invalid dimension {dim} for tensor with {input.ndim} dimensions"
+    assert -input.ndim <= dim < input.ndim, (
+        f"Invalid dimension {dim} for tensor with {input.ndim} dimensions"
+    )
 
     # Handle negative dim
     if dim < 0:
