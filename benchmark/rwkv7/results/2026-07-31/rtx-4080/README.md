@@ -39,3 +39,23 @@ compaction, abort, and post-abort slot-reuse checks. See the three
 `rwkv7-g1-2.9b/w4-hybrid-safe-d17883f3*` artifacts. The serving report
 explicitly records a two-token repeat/duplicate prefix gate rather than
 claiming bit-exact long synthetic quantized generation.
+
+## 512-token safe-cutoff update
+
+The 512-token FP16/INT32 safety cutoff was measured on `862f6328` and promoted
+as the default by `97116ffb`. New batch-8 artifacts are named
+`w4-hybrid-safe-th512-862f632*` under the 1.5B and 2.9B directories.
+
+For 1.5B, minimum ratios are 1.134x/1.062x/1.065x versus matched dense for
+prefill/decode/end-to-end, 0.994x prefill and 1.249x decode versus Albatross,
+and 1.118x/1.438x/1.327x versus Qwen3.5-2B. The model load is 2.63 GB versus
+3.03 GB dense. Its strict alignment report reproduces all four natural-prompt
+continuations exactly, and its serving report passes the complete repeat,
+batching, cache, compaction, abort, and slot-reuse lifecycle gate.
+
+For 2.9B, minimum ratios are 1.188x/1.088x/1.094x versus matched dense,
+1.084x prefill and 1.166x decode versus Albatross, and
+1.485x/1.636x/1.613x versus Qwen3.5-4B. Model load remains 5.00 GB versus
+5.68 GB dense. Strict teacher-forced alignment and all production lifecycle
+checks pass; its serving artifact retains the explicit two-token synthetic
+repeat-prefix disclosure.

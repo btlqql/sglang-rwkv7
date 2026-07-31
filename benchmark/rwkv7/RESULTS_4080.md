@@ -57,7 +57,10 @@ configured server state pool or total process peak.
 | --- | ---: | ---: |
 | Dense FP16 | 3.03 GB | reference |
 | W8 accuracy | 2.69 GB | -11.2% |
-| W4 hybrid accuracy | 2.44 GB | -19.5% |
+| W4 production-safe hybrid | 2.63 GB | -13.2% |
+
+The earlier 2.44 GB W4 result below predates the batch-invariant fallback
+shards and is retained only as a high-compression performance experiment.
 
 ## FP16-state performance lane
 
@@ -104,6 +107,43 @@ Batch-8 result:
   Its minimum gains are 12.9% prefill, 6.8% decode, and 6.8% end to end.
 - W4 hybrid accuracy is also faster in all 18 gates. Its minimum gains are
   2.3% prefill, 14.0% decode, and 12.7% end to end.
+
+### 1.5B production-safe W4 batch-8 slice (`97116ffb`)
+
+The production-safe policy stores FP16 fallback shards for alternating W4 key
+projections and uses exact INT32 W8 accumulation for small token batches. The
+512-token cutoff was measured through environment overrides on `862f6328` and
+promoted as the default by `97116ffb40341d8609e5154ec17ae7d4aeb9fd9d`.
+
+| Prompt | Decode | Prefill tok/s | Decode tok/s | E2E tok/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 128 | 26,704.4 | 1,523.9 | 1,452.0 |
+| 128 | 512 | 26,816.1 | 1,526.8 | 1,508.3 |
+| 512 | 128 | 29,191.0 | 1,526.2 | 1,270.4 |
+| 512 | 512 | 29,209.9 | 1,526.0 | 1,452.8 |
+| 2048 | 128 | 29,263.4 | 1,536.5 | 839.2 |
+| 2048 | 512 | 29,047.1 | 1,528.8 | 1,265.4 |
+
+Against the matched dense lane, the minimum gains are 1.134x prefill, 1.062x
+decode, and 1.065x end to end. Against Albatross 1.5B, decode is at least
+1.249x and prefill is 0.994x-1.003x, so the serving path is within 0.65% of the
+fixed-forward reference in every prefill cell. Against same-runtime
+Qwen3.5-2B, the minima are 1.118x prefill, 1.438x decode, and 1.327x end to
+end; raw decode exceeds the 2.0B/1.5B proportional target of 1.333x.
+
+The strict quant alignment gate passes with 0.1114 maximum chosen-token
+logprob error, 0.9680 mean top-10 overlap, and 1.0000 teacher-forced top-1
+agreement. All four 32-token natural-prompt continuations are exact. The
+serving harness also passes full deterministic replay, single-vs-batched
+prefix comparison, dynamic-batch isolation, cold/warm chunked prefill, a
+128-token cache hit, mixed-length compaction, abort, and post-abort slot reuse.
+Model-weight load is 2.63 GB versus 3.03 GB dense, a 13.2% reduction.
+
+Raw evidence:
+
+- `rwkv7-g1-1.5b/w4-hybrid-safe-th512-862f632.jsonl`
+- `rwkv7-g1-1.5b/w4-hybrid-safe-th512-862f632-alignment.json`
+- `rwkv7-g1-1.5b/w4-hybrid-safe-th512-862f632-serving.json`
 
 ## 2.9B dense/W8/W4 matrix
 
@@ -171,6 +211,37 @@ Raw evidence:
 - `rwkv7-g1-2.9b/w4-hybrid-safe-d17883f3.jsonl`
 - `rwkv7-g1-2.9b/w4-hybrid-safe-d17883f3-alignment.json`
 - `rwkv7-g1-2.9b/w4-hybrid-safe-d17883f3-serving.json`
+
+#### 512-token prefill cutoff update (`97116ffb`)
+
+The same safety policy was retuned so packed Marlin/native W8 takes over above
+512 tokens rather than above 1,024. This configuration was measured on
+`862f6328` and promoted as the default by `97116ffb`. It retains the 5.00 GB
+model-weight load and the same strict alignment/lifecycle results while
+removing the short-prefill regression:
+
+| Prompt | Decode | Prefill tok/s | Decode tok/s | E2E tok/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 128 | 16,292.4 | 817.9 | 784.7 |
+| 128 | 512 | 16,290.0 | 818.6 | 810.0 |
+| 512 | 128 | 17,457.3 | 815.8 | 691.8 |
+| 512 | 512 | 17,460.3 | 817.9 | 782.8 |
+| 2048 | 128 | 16,160.7 | 817.5 | 453.8 |
+| 2048 | 512 | 16,160.4 | 818.1 | 681.3 |
+
+Minimum ratios are 1.188x prefill, 1.088x decode, and 1.094x end to end versus
+matched dense; 1.084x prefill and 1.166x decode versus Albatross; and 1.485x
+prefill, 1.636x decode, and 1.613x end to end versus Qwen3.5-4B. Raw decode
+therefore clears the 4.0B/2.9B proportional target of 1.379x. The alignment
+gate remains at 0.2357 maximum logprob error, 0.9758 top-10 overlap, and 0.9766
+top-1 agreement. The two-token synthetic repeat-prefix disclosure remains
+unchanged; all cache, compaction, abort, and slot-reuse lifecycle gates pass.
+
+Raw evidence:
+
+- `rwkv7-g1-2.9b/w4-hybrid-safe-th512-862f632.jsonl`
+- `rwkv7-g1-2.9b/w4-hybrid-safe-th512-862f632-alignment.json`
+- `rwkv7-g1-2.9b/w4-hybrid-safe-th512-862f632-serving.json`
 
 ## 7.2B quantized capacity lane
 
