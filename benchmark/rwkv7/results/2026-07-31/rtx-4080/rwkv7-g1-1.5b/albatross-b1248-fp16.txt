@@ -1,0 +1,44 @@
+[rwkv7_fast_v3a] start model=/home/wzu/.private/rwkv7-hf-4080/models/rwkv7-g1g-1.5b-20260526-ctx8192.pth wkv=fp16 emb=gpu batched_rkv=off cmix_sparse=no-fc lowrank_weight=both orig_linear_groups=att_c2c,ffn_key,head pp=off
+[rwkv7_fast_v3a] fixed fast path: ln=v3a linear=v3a/splitk lowrank=7/4 nofc_rows=by_C row20_t=by_C nofc_t512_rows>=8
+[rwkv7_fast_v3a] loading CUDA extensions v3a_ops + fast_ops + wkv=fp16
+[rwkv7_fast_v3a] CUDA extensions loaded in 39.149s
+[rwkv7_fast_v3a] loading weights from /home/wzu/.private/rwkv7-hf-4080/models/rwkv7-g1g-1.5b-20260526-ctx8192.pth
+[rwkv7_fast_v3a] weights mmap loaded in 0.020s tensors=798
+[rwkv7_fast_v3a] detected model C=2048 H=32 N=64 V=65536
+[rwkv7_fast_v3a] cmix no-fc path: rows<=19 row20_t<=5
+[rwkv7_fast_v3a] moving and preprocessing weights to CUDA emb=gpu
+[rwkv7_fast_v3a] model ready in 1.847s L=24 C=2048 H=32 N=64 V=65536
+[rwkv7_fast_v3a] gpu_mem used=4.06GiB allocated=2.94GiB reserved=3.48GiB total=15.55GiB
+csv_header,label,B,T,iters,p10_ms,p50_ms,p90_ms,tok_s_p50
+RESULT B=1 T=1 iters=5 p10_ms=3.7383 p50_ms=3.7407 p90_ms=3.8270 tok_s_p50=267.33
+csv,rwkv7_fast_v3a,1,1,5,3.738266,3.740672,3.827034,267.331637
+RESULT B=1 T=128 iters=5 p10_ms=8.3341 p50_ms=8.3371 p90_ms=8.4122 tok_s_p50=15353.02
+csv,rwkv7_fast_v3a,1,128,5,8.334131,8.337120,8.412153,15353.023483
+RESULT B=1 T=512 iters=5 p10_ms=26.1829 p50_ms=26.1929 p90_ms=26.5275 tok_s_p50=19547.28
+csv,rwkv7_fast_v3a,1,512,5,26.182912,26.192896,26.527500,19547.284965
+RESULT B=1 T=2048 iters=5 p10_ms=95.7541 p50_ms=95.7583 p90_ms=95.8327 tok_s_p50=21387.17
+csv,rwkv7_fast_v3a,1,2048,5,95.754137,95.758339,95.832672,21387.171320
+RESULT B=2 T=1 iters=5 p10_ms=3.9669 p50_ms=3.9711 p90_ms=4.0047 tok_s_p50=503.64
+csv,rwkv7_fast_v3a,2,1,5,3.966861,3.971072,4.004659,503.642347
+RESULT B=2 T=128 iters=5 p10_ms=12.1381 p50_ms=12.3208 p90_ms=12.3244 tok_s_p50=20777.92
+csv,rwkv7_fast_v3a,2,128,5,12.138124,12.320768,12.324359,20777.924931
+RESULT B=2 T=512 iters=5 p10_ms=41.4970 p50_ms=41.5078 p90_ms=41.5691 tok_s_p50=24670.04
+csv,rwkv7_fast_v3a,2,512,5,41.496986,41.507839,41.569107,24670.038712
+RESULT B=2 T=2048 iters=5 p10_ms=167.4672 p50_ms=167.5026 p90_ms=168.3223 tok_s_p50=24453.36
+csv,rwkv7_fast_v3a,2,2048,5,167.467209,167.502563,168.322260,24453.357101
+RESULT B=4 T=1 iters=5 p10_ms=4.5226 p50_ms=4.5308 p90_ms=4.5718 tok_s_p50=882.84
+csv,rwkv7_fast_v3a,4,1,5,4.522598,4.530848,4.571750,882.836938
+RESULT B=4 T=128 iters=5 p10_ms=19.9528 p50_ms=19.9578 p90_ms=20.0301 tok_s_p50=25654.18
+csv,rwkv7_fast_v3a,4,128,5,19.952845,19.957760,20.030054,25654.181815
+RESULT B=4 T=512 iters=5 p10_ms=76.0768 p50_ms=76.1098 p90_ms=76.1582 tok_s_p50=26908.51
+csv,rwkv7_fast_v3a,4,512,5,76.076807,76.109756,76.158209,26908.508120
+RESULT B=4 T=2048 iters=5 p10_ms=294.5182 p50_ms=294.5823 p90_ms=295.4148 tok_s_p50=27808.87
+csv,rwkv7_fast_v3a,4,2048,5,294.518176,294.582275,295.414783,27808.869319
+RESULT B=8 T=1 iters=5 p10_ms=6.5456 p50_ms=6.5567 p90_ms=6.6175 tok_s_p50=1220.13
+csv,rwkv7_fast_v3a,8,1,5,6.545613,6.556672,6.617459,1220.131171
+RESULT B=8 T=128 iters=5 p10_ms=37.7743 p50_ms=38.1460 p90_ms=38.1716 tok_s_p50=26844.20
+csv,rwkv7_fast_v3a,8,128,5,37.774291,38.146049,38.171584,26844.195230
+RESULT B=8 T=512 iters=5 p10_ms=140.5937 p50_ms=140.7099 p90_ms=141.5547 tok_s_p50=29109.54
+csv,rwkv7_fast_v3a,8,512,5,140.593668,140.709885,141.554663,29109.539890
+RESULT B=8 T=2048 iters=5 p10_ms=560.3929 p50_ms=560.4103 p90_ms=561.0072 tok_s_p50=29235.72
+csv,rwkv7_fast_v3a,8,2048,5,560.392908,560.410278,561.007227,29235.723601

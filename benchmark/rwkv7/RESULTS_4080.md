@@ -3,10 +3,10 @@
 Date: 2026-07-31
 
 This page records the current Ada optimization slice. It is intentionally
-narrower than the full acceptance contract in `RWKV7_HF_PARITY.md`: one
-RWKV-7 1.5B checkpoint, batch sizes 1/2/4/8, and one RTX 4080. It is an engineering
-snapshot, not a claim that the 216-cell, multi-model, or multi-hardware matrix
-is complete.
+narrower than the full acceptance contract in `RWKV7_HF_PARITY.md`: complete
+1.5B and 2.9B dense/W8/W4 batch matrices, a partial 7.2B capacity lane, and one
+RTX 4080. It is an engineering snapshot, not a claim that the multi-hardware
+matrix is complete.
 
 The matched dense/W8/W4 raw JSONL, alignment output, serving-feature output,
 and public environment manifest are stored under
@@ -15,7 +15,7 @@ strict FP32-state evidence remains under `results/2026-07-30/rtx-4080`.
 
 ## Workload
 
-- model: RWKV-7 G1 1.5B;
+- models: RWKV-7 G1 1.5B and 2.9B; 7.2B quantized capacity work is in progress;
 - device: NVIDIA GeForce RTX 4080, 16 GB;
 - activation dtype: FP16;
 - batch sizes: 1, 2, 4, and 8;
@@ -103,6 +103,35 @@ Batch-8 result:
 - W4 hybrid accuracy is also faster in all 18 gates. Its minimum gains are
   2.3% prefill, 14.0% decode, and 12.7% end to end.
 
+## 2.9B dense/W8/W4 matrix
+
+The 2.9B run uses the same 24 workload cells and exact aggregate-token graph
+buckets as 1.5B. All 72 dense/W8/W4 rows completed. Against its matched dense
+lane, every quantized prefill, decode, and end-to-end cell passes:
+
+| Mode | Prefill / dense | Decode / dense | E2E / dense |
+| --- | ---: | ---: | ---: |
+| W8 accuracy | 1.091x | 1.094x | 1.094x |
+| W4 hybrid accuracy | 1.087x | 1.231x | 1.179x |
+
+The reported model-weight memory is 5.68 GB dense, 4.98 GB W8, and 4.28 GB W4
+hybrid. This is a 12.3% W8 and 24.6% W4 reduction. The independent quantized
+alignment gate also passes:
+
+| Mode | Max chosen-token logprob error | Mean error | Mean top-10 overlap | Teacher-forced top-1 agreement | Gate |
+| --- | ---: | ---: | ---: | ---: | --- |
+| W8 accuracy | 0.1322 | 0.0180 | 0.9625 | 0.9844 | pass (`0.25 / 0.80 / 0.90`) |
+| W4 hybrid accuracy | 0.6088 | 0.0632 | 0.9203 | 0.9531 | pass (`1.00 / 0.80 / 0.90`) |
+
+## 7.2B quantized capacity lane
+
+The 16 GB card cannot host the dense 7.2B production graph matrix, so dense
+speed parity remains a 24 GB card requirement. W4 hybrid loads at 9.71 GB and
+passes the split-reference alignment gate with 0.3455 maximum chosen-token
+logprob error, 0.9203 mean top-10 overlap, and 0.9766 teacher-forced top-1
+agreement. W8 loads at 11.56 GB; its corrected state-pool configuration and
+split-graph performance run remain in progress.
+
 ## Prior strict FP32-state W8 lane
 
 The following commit-`a590b2a` lane is retained from the 2026-07-30 evidence.
@@ -154,10 +183,17 @@ llama.cpp-quality quantization parity.
   fixed-forward harness have different outer timing semantics, so these ratios
   are recorded as the requested engineering acceptance comparison rather than
   a claim of identical API overhead.
-- The existing HF-derived Qwen3.5 batch-8 speed gate was green in these six
-  dense cells. The same-runtime SGLang Qwen3.5 rerun is still in progress. Its
-  hybrid attention path does not support the RWKV-specific full-prefill graph,
-  so the matched production baseline uses eager prefill and full decode graphs.
+- The same-runtime SGLang Qwen3.5-2B BF16 baseline now contains all 24 cells.
+  At batch 8, dense RWKV has minimum prefill/decode/E2E ratios of
+  0.992x/1.077x/1.075x. The active-work decode score is currently at least
+  1.435x against the 1.75x target. Qwen's hybrid attention path does not support
+  the RWKV-specific full-prefill graph, so this baseline uses eager prefill and
+  full decode graphs.
+- A fresh full Albatross 1.5B rerun contains all 16 fixed-forward shapes. W8
+  remains green at batch 8 (minimum 1.006x prefill and 1.012x decode), while
+  smaller-batch decode and dense/W4 prefill expose the remaining host-loop and
+  short-prefill gaps. These red cells remain visible rather than being replaced
+  by the earlier, narrower batch-8 reference.
 
 ## Serving and graph validation
 
@@ -176,8 +212,8 @@ llama.cpp-quality quantization parity.
 
 1. Narrow the FP32-state versus FP16-state prefill cost while retaining exact
    cold/warm cache continuation.
-2. Extend the now-green batch-1/2/4/8 quant-vs-dense slice to every Albatross
-   and Qwen3.5 gate.
-3. Complete the running 2.9B/7.2B model matrices.
-4. Run same-runtime Qwen3.5 and larger-model Albatross baselines under the
-   final acceptance environment.
+2. Amortize the decode host loop with matched continuous-step runs and close
+   the remaining Albatross B1/2/4 and Qwen3.5 active-work gaps.
+3. Close short-prefill red cells without weakening chunked-prefill handoff.
+4. Complete the running 2.9B/7.2B Albatross, Qwen3.5, and 7.2B split-graph
+   matrices.
