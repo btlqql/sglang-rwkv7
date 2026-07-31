@@ -147,7 +147,7 @@ def _rwkv7_w4_policy() -> str:
 
 def _rwkv7_marlin_fallback_max_tokens() -> int:
     """Token-count limit for the batch-invariant dense W4 accuracy fallback."""
-    raw = os.getenv("SGLANG_RWKV7_MARLIN_FALLBACK_MAX_TOKENS", "1024")
+    raw = os.getenv("SGLANG_RWKV7_MARLIN_FALLBACK_MAX_TOKENS", "512")
     try:
         value = int(raw)
     except ValueError as exc:
@@ -164,7 +164,7 @@ def _rwkv7_marlin_fallback_max_tokens() -> int:
 
 def _rwkv7_int8_exact_max_tokens() -> int:
     """Token-count limit for batch-invariant INT32 W8A8 accumulation."""
-    raw = os.getenv("SGLANG_RWKV7_INT8_EXACT_MAX_TOKENS", "1024")
+    raw = os.getenv("SGLANG_RWKV7_INT8_EXACT_MAX_TOKENS", "512")
     try:
         value = int(raw)
     except ValueError as exc:

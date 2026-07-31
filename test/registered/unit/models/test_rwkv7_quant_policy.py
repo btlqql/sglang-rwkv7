@@ -123,6 +123,8 @@ class TestRwkv7QuantPolicy(unittest.TestCase):
                 _rwkv7_projection_quant_config(quant, "attention", 0, 24)
 
     def test_marlin_fallback_limit_is_configurable(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_rwkv7_marlin_fallback_max_tokens(), 512)
         with patch.dict(
             os.environ, {"SGLANG_RWKV7_MARLIN_FALLBACK_MAX_TOKENS": "2048"}
         ):
@@ -137,6 +139,8 @@ class TestRwkv7QuantPolicy(unittest.TestCase):
                 _rwkv7_marlin_fallback_max_tokens()
 
     def test_int8_exact_limit_is_configurable(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_rwkv7_int8_exact_max_tokens(), 512)
         with patch.dict(os.environ, {"SGLANG_RWKV7_INT8_EXACT_MAX_TOKENS": "2048"}):
             self.assertEqual(_rwkv7_int8_exact_max_tokens(), 2048)
         with patch.dict(os.environ, {"SGLANG_RWKV7_INT8_EXACT_MAX_TOKENS": "-1"}):
