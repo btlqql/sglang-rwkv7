@@ -949,33 +949,35 @@ class MarlinLinearMethod(LinearMethodBase):
 
         # Some recurrent models need batch-layout-invariant projection results:
         # a one-ULP row-order change can accumulate through state and eventually
-        # change greedy output. Such a model may attach a compact INT8 shadow
-        # for small token batches while retaining packed Marlin weights for
-        # throughput-oriented prefill. The hook is opt-in and therefore has no
-        # memory or dispatch cost for ordinary Marlin layers.
+        # change greedy output. Such a model may attach an exact dense or a
+        # compact INT8 shadow for small token batches while retaining packed
+        # Marlin weights for throughput-oriented prefill. The hook is opt-in
+        # and therefore has no memory or dispatch cost for ordinary layers.
+        dense_shadow = getattr(layer, "_rwkv7_decode_weight", None)
         int8_shadow = getattr(layer, "_rwkv7_decode_qweight", None)
         shadow_scales = getattr(layer, "_rwkv7_decode_scales", None)
         fallback_max_tokens = getattr(layer, "_rwkv7_marlin_fallback_max_tokens", 0)
-        use_int8_shadow = (
-            int8_shadow is not None
-            and shadow_scales is not None
-            and size_m <= fallback_max_tokens
-        )
-        if use_int8_shadow and size_m > 8:
+        use_shadow = (
+            dense_shadow is not None
+            or (int8_shadow is not None and shadow_scales is not None)
+        ) and size_m <= fallback_max_tokens
+        if use_shadow and size_m > 8:
             # Full-prefill CUDA Graphs replay the captured branch without
             # re-entering Python. The generic capture-mode flag only covers
             # decode graphs, while the prefill runner publishes this context
             # for both warmup and capture. Keep full-prefill graphs on Marlin;
-            # eager short prefills use the batch-stable fused INT8 shadow.
+            # eager short prefills use the checkpoint-selected accuracy shadow.
             from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
                 get_tc_piecewise_forward_context,
             )
 
             forward_context = get_tc_piecewise_forward_context()
-            use_int8_shadow = not (
+            use_shadow = not (
                 forward_context is not None and forward_context.full_graph
             )
-        if use_int8_shadow:
+        if use_shadow and dense_shadow is not None:
+            output_2d = torch.nn.functional.linear(x_2d, dense_shadow)
+        elif use_shadow:
             from sglang.srt.layers.quantization.rwkv7_w4 import (
                 rwkv7_w4_int8_shadow_gemm,
             )

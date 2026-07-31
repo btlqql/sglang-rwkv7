@@ -6,6 +6,7 @@ from sglang.srt.models.rwkv7 import (
     _rwkv7_int8_exact_max_tokens,
     _rwkv7_marlin_fallback_max_tokens,
     _rwkv7_projection_quant_config,
+    _rwkv7_w4_shadow_mode,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -137,6 +138,17 @@ class TestRwkv7QuantPolicy(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "must be an integer"):
                 _rwkv7_marlin_fallback_max_tokens()
+
+    def test_w4_shadow_mode_is_size_aware_and_overrideable(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_rwkv7_w4_shadow_mode(2048), "fp16")
+            self.assertEqual(_rwkv7_w4_shadow_mode(2560), "int8")
+        for mode in ("fp16", "int8"):
+            with patch.dict(os.environ, {"SGLANG_RWKV7_W4_SHADOW": mode}):
+                self.assertEqual(_rwkv7_w4_shadow_mode(4096), mode)
+        with patch.dict(os.environ, {"SGLANG_RWKV7_W4_SHADOW": "unknown"}):
+            with self.assertRaisesRegex(ValueError, "auto, fp16, or int8"):
+                _rwkv7_w4_shadow_mode(2048)
 
     def test_int8_exact_limit_is_configurable(self):
         with patch.dict(os.environ, {}, clear=True):

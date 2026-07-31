@@ -166,6 +166,25 @@ def _rwkv7_marlin_fallback_max_tokens() -> int:
     return value
 
 
+def _rwkv7_w4_shadow_mode(hidden_size: int) -> str:
+    """Choose the small-M W4 accuracy shadow.
+
+    The 2048-wide checkpoint has several near-tied greedy logits for which a
+    per-channel W8 projection can amplify chunk-boundary rounding through the
+    recurrence. Keep its exact FP16 shard by default. Wider checkpoints use
+    the compact fused INT8 shadow; callers may override either choice for an
+    explicit memory/accuracy experiment.
+    """
+    mode = os.getenv("SGLANG_RWKV7_W4_SHADOW", "auto").lower()
+    if mode == "auto":
+        return "fp16" if hidden_size <= 2048 else "int8"
+    if mode not in ("fp16", "int8"):
+        raise ValueError(
+            "SGLANG_RWKV7_W4_SHADOW must be auto, fp16, or int8; " f"got {mode!r}."
+        )
+    return mode
+
+
 def _rwkv7_int8_exact_max_tokens() -> int:
     """Token-count limit for batch-invariant INT32 W8A8 accumulation."""
     raw = os.getenv("SGLANG_RWKV7_INT8_EXACT_MAX_TOKENS", "512")
@@ -738,31 +757,42 @@ class Rwkv7FeedForward(nn.Module):
             and key_quant_config.get_name() == "marlin"
             and _rwkv7_w4_policy() == "accuracy"
         ):
-            # Marlin remains the throughput path for large prefills. Small
-            # token batches use a row-major per-channel INT8 shadow with a
-            # fixed-shape fused decode kernel. It is independent of batch shape,
-            # without retaining an FP16 copy of the projection.
+            # Marlin remains the throughput path for large prefills. The
+            # checkpoint-sensitive small-M shadow is exact FP16 at width 2048
+            # and compact fused INT8 on wider models (overridable by env).
             local_inter = self.key.s.shape[1]
-            self.key.register_buffer(
-                "_rwkv7_decode_qweight",
-                torch.empty(
-                    local_inter,
-                    H,
-                    dtype=torch.int8,
-                    device=self.key.s.device,
-                ),
-                persistent=False,
-            )
-            self.key.register_buffer(
-                "_rwkv7_decode_scales",
-                torch.empty(
-                    local_inter,
-                    1,
-                    dtype=torch.float32,
-                    device=self.key.s.device,
-                ),
-                persistent=False,
-            )
+            if _rwkv7_w4_shadow_mode(H) == "fp16":
+                self.key.register_buffer(
+                    "_rwkv7_decode_weight",
+                    torch.empty(
+                        local_inter,
+                        H,
+                        dtype=self.key.s.dtype,
+                        device=self.key.s.device,
+                    ),
+                    persistent=False,
+                )
+            else:
+                self.key.register_buffer(
+                    "_rwkv7_decode_qweight",
+                    torch.empty(
+                        local_inter,
+                        H,
+                        dtype=torch.int8,
+                        device=self.key.s.device,
+                    ),
+                    persistent=False,
+                )
+                self.key.register_buffer(
+                    "_rwkv7_decode_scales",
+                    torch.empty(
+                        local_inter,
+                        1,
+                        dtype=torch.float32,
+                        device=self.key.s.device,
+                    ),
+                    persistent=False,
+                )
             self.key._rwkv7_marlin_fallback_max_tokens = (
                 _rwkv7_marlin_fallback_max_tokens()
             )
@@ -1078,7 +1108,26 @@ class Rwkv7ForCausalLM(nn.Module):
                     )
                 shadow_name = marlin_prefix + "._rwkv7_decode_qweight"
                 shadow_scale_name = marlin_prefix + "._rwkv7_decode_scales"
-                if shadow_name in params_dict:
+                dense_shadow_name = marlin_prefix + "._rwkv7_decode_weight"
+                if dense_shadow_name in params_dict:
+                    packed_weight, weight_scale = _online_marlin_quantize_weight(
+                        loaded_weight,
+                        group_size=self.quant_config.group_size,
+                    )
+                    dense_shadow = params_dict[dense_shadow_name]
+                    fallback_weight = loaded_weight
+                    if fallback_weight.shape != dense_shadow.shape:
+                        shard = dense_shadow.shape[0]
+                        fallback_weight = fallback_weight.narrow(
+                            0, tp_rank * shard, shard
+                        )
+                    dense_shadow.copy_(
+                        fallback_weight.to(
+                            device=dense_shadow.device, dtype=dense_shadow.dtype
+                        )
+                    )
+                    loaded_params.add(dense_shadow_name)
+                elif shadow_name in params_dict:
                     if _online_marlin_quantize_weight_with_int8_shadow is None:
                         raise RuntimeError(
                             "RWKV-7 online W4 shadow requires NVIDIA SM80 or newer."
