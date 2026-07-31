@@ -44,9 +44,33 @@ The default policy is `accuracy`.
 
 `balanced` and `speed` are explicit pure-W4 opt-in policies. The default hybrid
 accuracy policy keeps meaningful W4 coverage for large prefills. For small
-token batches it uses an FP16 shard of the W4 key projection, and W8 uses exact
-INT32 accumulation, because recurrent state can amplify row-layout rounding
-into different long greedy continuations.
+token batches it now chooses the shadow by hidden width: exact FP16 for the
+2,048-wide 1.5B checkpoint and compact fused INT8 for wider checkpoints. Full
+prefill graphs retain Marlin W4. W8 uses exact INT32 accumulation because
+recurrent state can amplify row-layout rounding into different long greedy
+continuations. `SGLANG_RWKV7_W4_SHADOW` overrides the automatic choice.
+
+## Current W4 batch-8 lane (`cbc295c` / `5a2b575`)
+
+| Model | Shadow | Model memory | Prefill tok/s | Decode tok/s | Alignment max / top-10 / top-1 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1.5B | FP16 | 2.63 GB | 26,793-29,485 | 1,530-1,546 | 0.1114 / 0.9680 / 1.0000 |
+| 2.9B | fused INT8 | 4.72 GB | 16,249-17,488 | 850-852 | 0.1763 / 0.9781 / 0.9922 |
+| 7.2B | fused INT8 | 10.83 GB | 7,276-7,563 | 417 | 0.0949 / 0.9711 / 1.0000 |
+
+The 2.9B compact lane preserves the prior Marlin prefill throughput while
+improving decode by at least 3.89% and reducing model memory by 5.6%. The 7.2B
+lane improves prefill by 1.99%-6.85%, decode by at least 6.02%, reduces model
+memory by 6.5%, and now fits the complete 16,384-token full-prefill graph.
+The 1.5B exact shadow preserves its cache-correct accuracy lane and remains
+within -0.15%/+0.76% of the prior prefill result.
+
+Current serving evidence is fail-closed: 1.5B and 2.9B disclose a two-token
+synthetic repeat/single-vs-batch gate but pass exact cold/warm chunked prefill,
+the 128-token state-cache hit, compaction, abort, and slot reuse. 7.2B passes
+the full deterministic 32-token and lifecycle gate. The raw artifacts are the
+`w4-auto-*-cbc295c*` and `w4-fused-shadow-fullctx-5a2b575*` files under the
+dated result directory.
 
 ## Model-weight memory
 

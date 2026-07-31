@@ -27,6 +27,60 @@ The first matrix command accidentally supplied the Albatross commit in the
 HF acceptance commit from `environment.json`; numeric measurements, samples,
 model code SHA, and baseline files are unchanged.
 
+## Width-specialized W4 shadow update
+
+Commits `5a2b575b0309afda6b0ff47492c259f943a9d33a` and
+`cbc295ced33373035c3bec888646cfc334914954` replace the universal persistent
+FP16 W4 fallback with a width-aware small-M policy:
+
+- full-prefill CUDA Graphs keep packed Marlin W4 for throughput;
+- 2.9B and 7.2B decode/eager short prefill use a compact per-channel INT8
+  shadow and fused integer GEMM;
+- the 2,048-wide 1.5B checkpoint keeps its exact FP16 shadow because its
+  near-tied synthetic logits are more sensitive to recurrent rounding;
+- `SGLANG_RWKV7_W4_SHADOW=fp16|int8` can override the automatic choice.
+
+Fresh batch-8 results use two warm-ups and the median of five samples:
+
+| Model / shadow | Model memory | Prefill tok/s range | Decode tok/s range | Change from prior safe W4 |
+| --- | ---: | ---: | ---: | --- |
+| 1.5B / FP16 | 2.63 GB | 26,793-29,485 | 1,530-1,546 | prefill -0.15% to +0.76%; decode +0.36% to +0.59% |
+| 2.9B / INT8 | 4.72 GB | 16,249-17,488 | 850-852 | prefill -0.26% to +0.18%; decode +3.89% to +4.15%; memory -5.6% |
+| 7.2B / INT8 | 10.83 GB | 7,276-7,563 | 417 | prefill +1.99% to +6.85%; decode +6.02% to +6.16%; memory -6.5% |
+
+The 1.5B matrix remains at least 1.142x/1.066x/1.070x matched dense for
+prefill/decode/end-to-end and 1.123x/1.444x/1.335x same-runtime Qwen3.5-2B.
+Relative to Albatross, decode is 1.254x-1.267x and prefill is within
+-0.80%/+0.85%. Its alignment gate passes at 0.1114 maximum chosen-token
+logprob error, 0.9680 mean top-10 overlap, and 1.0000 teacher-forced top-1
+agreement.
+
+The 2.9B matrix is at least 1.187x/1.133x/1.137x matched dense,
+1.484x/1.704x/1.648x Qwen3.5-4B, and 1.083x/1.214x Albatross for
+prefill/decode. Its alignment gate passes at 0.1763 maximum error, 0.9781
+top-10 overlap, and 0.9922 teacher-forced top-1 agreement.
+
+The 1.5B and 2.9B serving reports deliberately retain a two-token synthetic
+repeat/single-vs-batch gate rather than claiming bit-exact long quantized
+generation. Both pass exact cold/warm chunked-prefill output, a 128-token state
+cache hit, dynamic-batch duplicate isolation, mixed-length compaction, abort,
+and post-abort state reuse. The 7.2B report passes the complete 32-token
+deterministic gate, exact single-vs-batch output, cache restore, and the full
+lifecycle checks. Its alignment report has 0.0949 maximum error, 0.9711 top-10
+overlap, 1.0000 top-1 agreement, and four exact natural-prompt continuations.
+
+The compact 7.2B layout also frees enough memory to capture the complete
+16,384-token full-prefill graph on the 16 GB card; the prior 11.58 GB safe lane
+missed that graph by about 192 MiB and had to use eager 2,048-token-per-request
+prefill. Dense 7.2B, full Albatross batch 8, and Qwen3.5-9B still require the
+separate 24 GB matched-runtime lane and are not inferred here.
+
+Raw evidence:
+
+- `rwkv7-g1-1.5b/w4-auto-fp16-shadow-cbc295c*`
+- `rwkv7-g1-2.9b/w4-auto-int8-shadow-cbc295c*`
+- `rwkv7-g1-7.2b/w4-fused-shadow-fullctx-5a2b575*`
+
 ## Production-safe 2.9B W4 update
 
 Commit `d17883f3f671adb8d0998034072649a88931e95d` adds a safer 2.9B W4 hybrid
