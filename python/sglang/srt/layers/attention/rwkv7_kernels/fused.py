@@ -537,6 +537,142 @@ def _lowrank4_up_kernel(
             tl.store(out_ptr + (3 * M + row) * H + channel, result)
 
 
+@triton.jit
+def _lowrank4_up_dot_kernel(
+    rank_ptr,
+    ww_ptr,
+    wa_ptr,
+    wg_ptr,
+    wv_ptr,
+    bw_ptr,
+    ba_ptr,
+    bv_ptr,
+    value_ptr,
+    v_first_ptr,
+    out_ptr,
+    M: tl.constexpr,
+    H: tl.constexpr,
+    RW: tl.constexpr,
+    RA: tl.constexpr,
+    RG: tl.constexpr,
+    RV: tl.constexpr,
+    HAS_V: tl.constexpr,
+    BKW: tl.constexpr,
+    BKA: tl.constexpr,
+    BKG: tl.constexpr,
+    BKV: tl.constexpr,
+    BN: tl.constexpr,
+    BM: tl.constexpr,
+):
+    """Tensor-core grouped rank-out projection for production hidden sizes."""
+    group = tl.program_id(0)
+    n = tl.program_id(1) * BN + tl.arange(0, BN)
+    rows = tl.arange(0, BM)
+    row_mask = rows < M
+    n_mask = n < H
+    total_rank = RW + RA + RG + RV
+    DT = out_ptr.dtype.element_ty
+
+    if group == 0:
+        k_w = tl.arange(0, BKW)
+        control_w = tl.load(
+            rank_ptr + rows[:, None] * total_rank + k_w[None, :],
+            mask=row_mask[:, None] & (k_w[None, :] < RW),
+            other=0.0,
+        )
+        control_w = libdevice.tanh(control_w.to(tl.float32)).to(DT)
+        weight_w = tl.load(
+            ww_ptr + n[None, :] * RW + k_w[:, None],
+            mask=n_mask[None, :] & (k_w[:, None] < RW),
+            other=0.0,
+        )
+        raw_w = tl.dot(control_w, weight_w)
+        raw_w += tl.load(bw_ptr + n, mask=n_mask, other=0.0)[None, :]
+        raw_w = raw_w.to(DT).to(tl.float32)
+        gate_w = (1.0 / (1.0 + tl.exp(-raw_w))).to(DT).to(tl.float32)
+        result_w = ((-gate_w).to(DT).to(tl.float32) * 0.6065306597126334).to(DT)
+        tl.store(
+            out_ptr + rows[:, None] * H + n[None, :],
+            result_w,
+            mask=row_mask[:, None] & n_mask[None, :],
+        )
+    elif group == 1:
+        k_a = tl.arange(0, BKA)
+        control_a = tl.load(
+            rank_ptr + rows[:, None] * total_rank + RW + k_a[None, :],
+            mask=row_mask[:, None] & (k_a[None, :] < RA),
+            other=0.0,
+        )
+        weight_a = tl.load(
+            wa_ptr + n[None, :] * RA + k_a[:, None],
+            mask=n_mask[None, :] & (k_a[:, None] < RA),
+            other=0.0,
+        )
+        raw_a = tl.dot(control_a, weight_a)
+        raw_a += tl.load(ba_ptr + n, mask=n_mask, other=0.0)[None, :]
+        raw_a = raw_a.to(DT).to(tl.float32)
+        result_a = (1.0 / (1.0 + tl.exp(-raw_a))).to(DT)
+        tl.store(
+            out_ptr + (M + rows[:, None]) * H + n[None, :],
+            result_a,
+            mask=row_mask[:, None] & n_mask[None, :],
+        )
+    elif group == 2:
+        k_g = tl.arange(0, BKG)
+        control_g = tl.load(
+            rank_ptr + rows[:, None] * total_rank + RW + RA + k_g[None, :],
+            mask=row_mask[:, None] & (k_g[None, :] < RG),
+            other=0.0,
+        )
+        control_g = (1.0 / (1.0 + tl.exp(-control_g.to(tl.float32)))).to(DT)
+        weight_g = tl.load(
+            wg_ptr + n[None, :] * RG + k_g[:, None],
+            mask=n_mask[None, :] & (k_g[:, None] < RG),
+            other=0.0,
+        )
+        result_g = tl.dot(control_g, weight_g).to(DT)
+        tl.store(
+            out_ptr + (2 * M + rows[:, None]) * H + n[None, :],
+            result_g,
+            mask=row_mask[:, None] & n_mask[None, :],
+        )
+    elif HAS_V:
+        k_v = tl.arange(0, BKV)
+        control_v = tl.load(
+            rank_ptr + rows[:, None] * total_rank + RW + RA + RG + k_v[None, :],
+            mask=row_mask[:, None] & (k_v[None, :] < RV),
+            other=0.0,
+        )
+        weight_v = tl.load(
+            wv_ptr + n[None, :] * RV + k_v[:, None],
+            mask=n_mask[None, :] & (k_v[:, None] < RV),
+            other=0.0,
+        )
+        raw_v = tl.dot(control_v, weight_v)
+        raw_v += tl.load(bv_ptr + n, mask=n_mask, other=0.0)[None, :]
+        raw_v = raw_v.to(DT).to(tl.float32)
+        gate_v = (1.0 / (1.0 + tl.exp(-raw_v))).to(DT).to(tl.float32)
+        offsets_v = rows[:, None] * H + n[None, :]
+        value = tl.load(
+            value_ptr + offsets_v,
+            mask=row_mask[:, None] & n_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        v_first = tl.load(
+            v_first_ptr + offsets_v,
+            mask=row_mask[:, None] & n_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        delta_v = (v_first - value).to(DT).to(tl.float32)
+        update_v = (delta_v * gate_v).to(DT).to(tl.float32)
+        result_v = (value + update_v).to(DT)
+        tl.store(
+            out_ptr + (3 * M + rows[:, None]) * H + n[None, :],
+            result_v,
+            mask=row_mask[:, None] & n_mask[None, :],
+        )
+
+
 def _plain_linear_weight(module):
     weight = getattr(module, "weight", None)
     if (
@@ -649,27 +785,55 @@ def fused_lowrank_controls(
     outputs = torch.empty(
         (4 if has_v else 3, M, hidden), dtype=xw.dtype, device=xw.device
     )
-    _lowrank4_up_kernel[(4, hidden)](
-        rank_values,
-        *ups,
-        bw,
-        ba,
-        bv,
-        value,
-        v_first,
-        outputs,
-        M=M,
-        H=hidden,
-        RW=rw,
-        RA=ra,
-        RG=rg,
-        RV=rv,
-        HAS_V=has_v,
-        BR=triton.next_power_of_2(max(ranks)),
-        num_warps=4,
-        num_stages=1,
-        enable_fp_fusion=False,
-    )
+    if hidden >= 1024:
+        _lowrank4_up_dot_kernel[(4, triton.cdiv(hidden, 64))](
+            rank_values,
+            *ups,
+            bw,
+            ba,
+            bv,
+            value,
+            v_first,
+            outputs,
+            M=M,
+            H=hidden,
+            RW=rw,
+            RA=ra,
+            RG=rg,
+            RV=rv,
+            HAS_V=has_v,
+            BKW=triton.next_power_of_2(rw),
+            BKA=triton.next_power_of_2(ra),
+            BKG=triton.next_power_of_2(rg),
+            BKV=triton.next_power_of_2(max(rv, 16)),
+            BN=64,
+            BM=16,
+            num_warps=4,
+            num_stages=1,
+            enable_fp_fusion=False,
+        )
+    else:
+        _lowrank4_up_kernel[(4, hidden)](
+            rank_values,
+            *ups,
+            bw,
+            ba,
+            bv,
+            value,
+            v_first,
+            outputs,
+            M=M,
+            H=hidden,
+            RW=rw,
+            RA=ra,
+            RG=rg,
+            RV=rv,
+            HAS_V=has_v,
+            BR=triton.next_power_of_2(max(ranks)),
+            num_warps=4,
+            num_stages=1,
+            enable_fp_fusion=False,
+        )
     if has_v:
         return outputs[0], outputs[1], outputs[2], outputs[3]
     return outputs[0], outputs[1], outputs[2], value

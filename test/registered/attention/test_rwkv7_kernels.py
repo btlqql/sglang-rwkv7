@@ -572,6 +572,51 @@ class TestRwkv7Kernels(unittest.TestCase):
         self.assertFalse(is_profitable_fused_lowrank_shape(5120, 1))
         self.assertFalse(is_profitable_fused_lowrank_shape(2048, 16))
 
+    def test_fused_lowrank_tensorcore_up_matches_modules(self):
+        class LowRank(nn.Module):
+            def __init__(self, hidden, rank, activation, bias):
+                super().__init__()
+                self.lora = nn.Sequential(
+                    nn.Linear(hidden, rank, bias=False),
+                    activation,
+                    nn.Linear(rank, hidden, bias=bias),
+                ).to(device="cuda", dtype=torch.float16)
+
+            def forward(self, value):
+                return self.lora(value)
+
+        batch, hidden = 8, 1024
+        modules = (
+            LowRank(hidden, 48, nn.Tanh(), True),
+            LowRank(hidden, 48, nn.Identity(), True),
+            LowRank(hidden, 128, nn.Sigmoid(), False),
+            LowRank(hidden, 32, nn.Identity(), True),
+        )
+        inputs = [
+            torch.randn(batch, hidden, device="cuda", dtype=torch.float16)
+            for _ in range(4)
+        ]
+        value = torch.randn_like(inputs[0])
+        v_first = torch.randn_like(value)
+        w_lora, a_lora, g_lora, v_lora = modules
+        expected = (
+            -torch.sigmoid(w_lora(inputs[0])) * (2.718281828459045**-0.5),
+            torch.sigmoid(a_lora(inputs[1])),
+            g_lora(inputs[2]),
+            value + (v_first - value) * torch.sigmoid(v_lora(inputs[3])),
+        )
+        actual = fused_lowrank_controls(
+            *inputs,
+            value,
+            v_first,
+            w_lora,
+            a_lora,
+            g_lora,
+            v_lora,
+        )
+        for result, reference in zip(actual, expected):
+            torch.testing.assert_close(result, reference, rtol=2e-2, atol=2e-2)
+
     def test_layernorm_token_shift_mix_decode_matches_torch(self):
         batch, hidden, slots = 8, 256, 16
         x = torch.randn(batch, hidden, device="cuda", dtype=torch.float16)

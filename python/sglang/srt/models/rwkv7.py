@@ -570,7 +570,7 @@ class Rwkv7Attention(nn.Module):
         if (
             stacked is not None
             and fused
-            and T in (1, 2, 4, 8)
+            and (T in (1, 2, 4, 8) or T >= 256)
             and stacked.device == xr.device
             and stacked.dtype == xr.dtype
             and self.r_proj.weight.data_ptr() == stacked[0].data_ptr()
