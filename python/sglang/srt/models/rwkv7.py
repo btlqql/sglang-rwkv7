@@ -93,6 +93,7 @@ logger = logging.getLogger(__name__)
 
 _RWKV7_W8A8_CONFIG: Optional[QuantizationConfig] = None
 _online_marlin_quantize_weight = None
+_online_marlin_quantize_weight_with_int8_shadow = None
 if (
     torch.cuda.is_available()
     and torch.version.hip is None
@@ -100,6 +101,9 @@ if (
 ):
     from sglang.srt.layers.quantization.marlin_utils import (
         online_marlin_quantize_weight as _online_marlin_quantize_weight,
+    )
+    from sglang.srt.layers.quantization.marlin_utils import (
+        online_marlin_quantize_weight_with_int8_shadow as _online_marlin_quantize_weight_with_int8_shadow,
     )
 
 
@@ -146,7 +150,7 @@ def _rwkv7_w4_policy() -> str:
 
 
 def _rwkv7_marlin_fallback_max_tokens() -> int:
-    """Token-count limit for the batch-invariant dense W4 accuracy fallback."""
+    """Token-count limit for the batch-invariant W4 accuracy shadow."""
     raw = os.getenv("SGLANG_RWKV7_MARLIN_FALLBACK_MAX_TOKENS", "512")
     try:
         value = int(raw)
@@ -734,17 +738,27 @@ class Rwkv7FeedForward(nn.Module):
             and key_quant_config.get_name() == "marlin"
             and _rwkv7_w4_policy() == "accuracy"
         ):
-            # Marlin remains the throughput path for large prefills.  Small
-            # token batches use the original FP16 shard to make recurrent
-            # output independent of row placement and dynamic-batch compaction.
-            # Non-persistent avoids duplicating this derived buffer on save.
+            # Marlin remains the throughput path for large prefills. Small
+            # token batches use a row-major per-channel INT8 shadow with a
+            # fixed-shape fused decode kernel. It is independent of batch shape,
+            # without retaining an FP16 copy of the projection.
             local_inter = self.key.s.shape[1]
             self.key.register_buffer(
-                "_rwkv7_decode_weight",
+                "_rwkv7_decode_qweight",
                 torch.empty(
                     local_inter,
                     H,
-                    dtype=self.key.s.dtype,
+                    dtype=torch.int8,
+                    device=self.key.s.device,
+                ),
+                persistent=False,
+            )
+            self.key.register_buffer(
+                "_rwkv7_decode_scales",
+                torch.empty(
+                    local_inter,
+                    1,
+                    dtype=torch.float32,
                     device=self.key.s.device,
                 ),
                 persistent=False,
@@ -1062,26 +1076,41 @@ class Rwkv7ForCausalLM(nn.Module):
                     raise RuntimeError(
                         "Online Marlin quantization requires NVIDIA SM80 or newer."
                     )
-                packed_weight, weight_scale = _online_marlin_quantize_weight(
-                    loaded_weight,
-                    group_size=self.quant_config.group_size,
-                )
-                dense_fallback_name = marlin_prefix + "._rwkv7_decode_weight"
-                if dense_fallback_name in params_dict:
-                    dense_fallback = params_dict[dense_fallback_name]
-                    fallback_weight = loaded_weight
-                    if fallback_weight.shape != dense_fallback.shape:
-                        shard = dense_fallback.shape[0]
-                        fallback_weight = fallback_weight.narrow(
-                            0, tp_rank * shard, shard
+                shadow_name = marlin_prefix + "._rwkv7_decode_qweight"
+                shadow_scale_name = marlin_prefix + "._rwkv7_decode_scales"
+                if shadow_name in params_dict:
+                    if _online_marlin_quantize_weight_with_int8_shadow is None:
+                        raise RuntimeError(
+                            "RWKV-7 online W4 shadow requires NVIDIA SM80 or newer."
                         )
-                    dense_fallback.copy_(
-                        fallback_weight.to(
-                            device=dense_fallback.device,
-                            dtype=dense_fallback.dtype,
+                    (
+                        packed_weight,
+                        weight_scale,
+                        shadow_weight,
+                        shadow_scales,
+                    ) = _online_marlin_quantize_weight_with_int8_shadow(
+                        loaded_weight,
+                        group_size=self.quant_config.group_size,
+                    )
+                    shadow = params_dict[shadow_name]
+                    fallback_scales = params_dict[shadow_scale_name]
+                    if shadow_weight.shape != shadow.shape:
+                        shard = shadow.shape[0]
+                        shadow_weight = shadow_weight.narrow(0, tp_rank * shard, shard)
+                        shadow_scales = shadow_scales.narrow(0, tp_rank * shard, shard)
+                    shadow.copy_(shadow_weight.to(device=shadow.device))
+                    fallback_scales.copy_(
+                        shadow_scales.to(
+                            device=fallback_scales.device,
+                            dtype=fallback_scales.dtype,
                         )
                     )
-                    loaded_params.add(dense_fallback_name)
+                    loaded_params.update((shadow_name, shadow_scale_name))
+                else:
+                    packed_weight, weight_scale = _online_marlin_quantize_weight(
+                        loaded_weight,
+                        group_size=self.quant_config.group_size,
+                    )
                 for target_name, tensor in (
                     (marlin_weight_name, packed_weight),
                     (marlin_scale_name, weight_scale),

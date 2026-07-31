@@ -176,13 +176,15 @@ python -m sglang.launch_server \
 
 The W4 accuracy policy keeps attention and edge FFN layers dense. In the
 middle stack, alternating FFN key projections use W4 Marlin; the remaining key
-and value projections use W8A8. Small projection batches of at most 512 tokens
-use the batch-invariant FP16/INT32 fallbacks, while larger prefills use the
-packed Marlin and native W8 kernels. This hybrid keeps a W4 memory/decode
-benefit without the large-batch pure-Marlin prefill regression. `balanced` and
-`speed` remain pure-W4 policies. Group size 128 is the supported online Marlin
-setting in the validated environment. The two cutoffs can be overridden with
-`SGLANG_RWKV7_MARLIN_FALLBACK_MAX_TOKENS` and
+and value projections use W8A8. For key projections, small batches of at most
+512 tokens use a compact per-channel INT8 shadow: decode uses a fixed 32-row
+fused kernel, and larger short prefills reconstruct the quantized dense weight
+without retaining an FP16 copy. Larger prefills use packed Marlin. W8
+contractions use the exact small-token path. This hybrid keeps a W4
+memory/decode benefit without the large-batch pure-Marlin prefill regression.
+`balanced` and `speed` remain pure-W4 policies. Group size 128 is the supported
+online Marlin setting in the validated environment. The two cutoffs can be
+overridden with `SGLANG_RWKV7_MARLIN_FALLBACK_MAX_TOKENS` and
 `SGLANG_RWKV7_INT8_EXACT_MAX_TOKENS` after repeating the correctness gate.
 
 ## Quantized alignment
