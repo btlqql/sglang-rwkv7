@@ -22,6 +22,7 @@ is still driven through HybridLinearAttnBackend, so `self.forward_metadata`
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
@@ -33,6 +34,8 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 # (T==1) AND the extend/prefill (packed varlen via cu_seqlens) path, with no
 # dependency on the flash-linear-attention package.
 from sglang.srt.layers.attention.rwkv7_kernels import (
+    layernorm_token_shift_lerp1_decode,
+    layernorm_token_shift_lerp6_decode,
     token_shift_lerp6_decode,
     token_shift_lerp6_packed_varlen,
     token_shift_packed_varlen,
@@ -328,6 +331,9 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
         layer_id: int,
         conv_idx: int,
         forward_batch: ForwardBatch,
+        norm_weight: Optional[torch.Tensor] = None,
+        norm_bias: Optional[torch.Tensor] = None,
+        norm_eps: float = 1e-5,
     ) -> torch.Tensor:
         """Fuse normal serving token shift/state update with six time mixes.
 
@@ -335,6 +341,33 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
         writes acceptance-window scratch rather than the persistent state pool.
         """
         mode = forward_batch.forward_mode
+        has_norm = norm_weight is not None
+        if (
+            has_norm
+            and x.dtype in (torch.float16, torch.bfloat16)
+            and not self.is_draft_worker
+            and not mode.is_draft_extend_v2()
+            and not mode.is_target_verify()
+            and mode.is_decode_or_idle()
+        ):
+            cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+            return layernorm_token_shift_lerp6_decode(
+                x,
+                cache.conv[conv_idx],
+                mix6,
+                norm_weight,
+                norm_bias,
+                norm_eps,
+                self.forward_metadata.mamba_cache_indices,
+            )
+        if has_norm:
+            x = F.layer_norm(
+                x,
+                (x.shape[-1],),
+                norm_weight,
+                norm_bias,
+                norm_eps,
+            )
         if self.is_draft_worker or mode.is_draft_extend_v2() or mode.is_target_verify():
             return fused_lerp6(
                 x,
@@ -355,6 +388,49 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
             md.query_start_loc,
             cache_indices,
         )
+
+    def token_shift_lerp1(
+        self,
+        x: torch.Tensor,
+        mix: torch.Tensor,
+        layer_id: int,
+        conv_idx: int,
+        forward_batch: ForwardBatch,
+        norm_weight: Optional[torch.Tensor] = None,
+        norm_bias: Optional[torch.Tensor] = None,
+        norm_eps: float = 1e-5,
+    ) -> torch.Tensor:
+        """Fuse the FFN decode LayerNorm, token shift and one time mix."""
+        mode = forward_batch.forward_mode
+        has_norm = norm_weight is not None
+        if (
+            has_norm
+            and x.dtype in (torch.float16, torch.bfloat16)
+            and not self.is_draft_worker
+            and not mode.is_draft_extend_v2()
+            and not mode.is_target_verify()
+            and mode.is_decode_or_idle()
+        ):
+            cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+            return layernorm_token_shift_lerp1_decode(
+                x,
+                cache.conv[conv_idx],
+                mix,
+                norm_weight,
+                norm_bias,
+                norm_eps,
+                self.forward_metadata.mamba_cache_indices,
+            )
+        if has_norm:
+            x = F.layer_norm(
+                x,
+                (x.shape[-1],),
+                norm_weight,
+                norm_bias,
+                norm_eps,
+            )
+        shifted = self.token_shift(x, layer_id, conv_idx, forward_batch)
+        return x + mix * (shifted - x)
 
     # ---- WKV recurrence (decode + extend both -> the wkv_recurrent kernel) ----
     def recurrence(

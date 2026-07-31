@@ -16,6 +16,221 @@ import triton.language as tl
 
 
 @triton.jit
+def _layernorm_token_shift_lerp6_decode_kernel(
+    x_ptr,
+    conv_ptr,
+    mix_ptr,
+    weight_ptr,
+    bias_ptr,
+    out_ptr,
+    cache_indices_ptr,
+    hidden_size: tl.constexpr,
+    conv_slots,
+    conv_stride_slot: tl.constexpr,
+    conv_stride_h: tl.constexpr,
+    EPS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Fuse decode LayerNorm, state shift/update and all six time mixes."""
+    request_index = tl.program_id(0)
+    hidden_offset = tl.arange(0, BLOCK_H)
+    mask = hidden_offset < hidden_size
+    row = request_index * hidden_size
+    raw = tl.load(x_ptr + row + hidden_offset, mask=mask, other=0.0).to(tl.float32)
+    mean = tl.sum(tl.where(mask, raw, 0.0), axis=0) / hidden_size
+    centered = tl.where(mask, raw - mean, 0.0)
+    variance = tl.sum(centered * centered, axis=0) / hidden_size
+    weight = tl.load(weight_ptr + hidden_offset, mask=mask, other=0.0).to(tl.float32)
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + hidden_offset, mask=mask, other=0.0).to(tl.float32)
+    else:
+        bias = 0.0
+    DT = out_ptr.dtype.element_ty
+    normalized = (centered * tl.rsqrt(variance + EPS) * weight + bias).to(DT)
+    normalized_fp32 = normalized.to(tl.float32)
+
+    raw_cache_index = tl.load(cache_indices_ptr + request_index)
+    valid_cache = (raw_cache_index >= 0) & (raw_cache_index < conv_slots)
+    cache_index = tl.minimum(tl.maximum(raw_cache_index, 0), conv_slots - 1).to(
+        tl.int64
+    )
+    conv_offset = cache_index * conv_stride_slot + hidden_offset * conv_stride_h
+    shifted = (
+        tl.load(conv_ptr + conv_offset, mask=mask, other=0.0).to(DT).to(tl.float32)
+    )
+    delta = (shifted - normalized_fp32).to(DT).to(tl.float32)
+    token_count = tl.num_programs(0)
+    for i in tl.static_range(6):
+        mix = tl.load(
+            mix_ptr + i * hidden_size + hidden_offset,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        product = (mix * delta).to(DT).to(tl.float32)
+        value = (normalized_fp32 + product).to(DT)
+        tl.store(
+            out_ptr + i * token_count * hidden_size + row + hidden_offset,
+            value,
+            mask=mask,
+        )
+    tl.store(
+        conv_ptr + conv_offset,
+        normalized,
+        mask=mask & valid_cache,
+    )
+
+
+@triton.jit
+def _layernorm_token_shift_lerp1_decode_kernel(
+    x_ptr,
+    conv_ptr,
+    mix_ptr,
+    weight_ptr,
+    bias_ptr,
+    out_ptr,
+    cache_indices_ptr,
+    hidden_size: tl.constexpr,
+    conv_slots,
+    conv_stride_slot: tl.constexpr,
+    conv_stride_h: tl.constexpr,
+    EPS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Fuse decode LayerNorm, FFN token shift/update and its single mix."""
+    request_index = tl.program_id(0)
+    hidden_offset = tl.arange(0, BLOCK_H)
+    mask = hidden_offset < hidden_size
+    row = request_index * hidden_size
+    raw = tl.load(x_ptr + row + hidden_offset, mask=mask, other=0.0).to(tl.float32)
+    mean = tl.sum(tl.where(mask, raw, 0.0), axis=0) / hidden_size
+    centered = tl.where(mask, raw - mean, 0.0)
+    variance = tl.sum(centered * centered, axis=0) / hidden_size
+    weight = tl.load(weight_ptr + hidden_offset, mask=mask, other=0.0).to(tl.float32)
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + hidden_offset, mask=mask, other=0.0).to(tl.float32)
+    else:
+        bias = 0.0
+    DT = out_ptr.dtype.element_ty
+    normalized = (centered * tl.rsqrt(variance + EPS) * weight + bias).to(DT)
+    normalized_fp32 = normalized.to(tl.float32)
+
+    raw_cache_index = tl.load(cache_indices_ptr + request_index)
+    valid_cache = (raw_cache_index >= 0) & (raw_cache_index < conv_slots)
+    cache_index = tl.minimum(tl.maximum(raw_cache_index, 0), conv_slots - 1).to(
+        tl.int64
+    )
+    conv_offset = cache_index * conv_stride_slot + hidden_offset * conv_stride_h
+    shifted = (
+        tl.load(conv_ptr + conv_offset, mask=mask, other=0.0).to(DT).to(tl.float32)
+    )
+    delta = (shifted - normalized_fp32).to(DT).to(tl.float32)
+    mix = tl.load(mix_ptr + hidden_offset, mask=mask, other=0.0).to(tl.float32)
+    product = (mix * delta).to(DT).to(tl.float32)
+    value = (normalized_fp32 + product).to(DT)
+    tl.store(out_ptr + row + hidden_offset, value, mask=mask)
+    tl.store(
+        conv_ptr + conv_offset,
+        normalized,
+        mask=mask & valid_cache,
+    )
+
+
+def _validate_layernorm_decode_inputs(x, conv, mix, weight, bias, cache_indices):
+    if x.ndim != 2 or x.shape[0] != cache_indices.numel():
+        raise ValueError(
+            "decode x must be [batch, hidden] with one cache index per row; "
+            f"got x={tuple(x.shape)}, indices={cache_indices.numel()}"
+        )
+    if conv.ndim != 3 or conv.shape[-1] != 1 or conv.shape[1] != x.shape[1]:
+        raise ValueError(
+            f"conv must have shape [slots, {x.shape[1]}, 1], got {tuple(conv.shape)}"
+        )
+    if weight.shape != (x.shape[1],):
+        raise ValueError(f"LayerNorm weight must have shape ({x.shape[1]},)")
+    if bias is not None and bias.shape != weight.shape:
+        raise ValueError("LayerNorm bias and weight must have identical shapes")
+    if mix.shape[-1] != x.shape[1]:
+        raise ValueError(f"time-mix hidden size must be {x.shape[1]}")
+
+
+def layernorm_token_shift_lerp6_decode(
+    x: torch.Tensor,
+    conv: torch.Tensor,
+    mix6: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    eps: float,
+    cache_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Decode-only fused LayerNorm + six-way time mix and state update."""
+    _validate_layernorm_decode_inputs(x, conv, mix6, weight, bias, cache_indices)
+    if mix6.shape != (6, x.shape[1]):
+        raise ValueError(f"mix6 must have shape (6, {x.shape[1]})")
+    x, mix6, weight = x.contiguous(), mix6.contiguous(), weight.contiguous()
+    bias_ptr = weight if bias is None else bias.contiguous()
+    out = torch.empty(6, *x.shape, dtype=x.dtype, device=x.device)
+    block_h = triton.next_power_of_2(x.shape[1])
+    _layernorm_token_shift_lerp6_decode_kernel[(x.shape[0],)](
+        x,
+        conv,
+        mix6,
+        weight,
+        bias_ptr,
+        out,
+        cache_indices,
+        x.shape[1],
+        conv.shape[0],
+        conv.stride(0),
+        conv.stride(1),
+        EPS=float(eps),
+        HAS_BIAS=bias is not None,
+        BLOCK_H=block_h,
+        num_warps=8 if block_h >= 2048 else 4,
+        enable_fp_fusion=False,
+    )
+    return out
+
+
+def layernorm_token_shift_lerp1_decode(
+    x: torch.Tensor,
+    conv: torch.Tensor,
+    mix: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    eps: float,
+    cache_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Decode-only fused LayerNorm + FFN time mix and state update."""
+    mix = mix.reshape(-1)
+    _validate_layernorm_decode_inputs(x, conv, mix, weight, bias, cache_indices)
+    x, mix, weight = x.contiguous(), mix.contiguous(), weight.contiguous()
+    bias_ptr = weight if bias is None else bias.contiguous()
+    out = torch.empty_like(x)
+    block_h = triton.next_power_of_2(x.shape[1])
+    _layernorm_token_shift_lerp1_decode_kernel[(x.shape[0],)](
+        x,
+        conv,
+        mix,
+        weight,
+        bias_ptr,
+        out,
+        cache_indices,
+        x.shape[1],
+        conv.shape[0],
+        conv.stride(0),
+        conv.stride(1),
+        EPS=float(eps),
+        HAS_BIAS=bias is not None,
+        BLOCK_H=block_h,
+        num_warps=8 if block_h >= 2048 else 4,
+        enable_fp_fusion=False,
+    )
+    return out
+
+
+@triton.jit
 def _store_lerp6(
     x,
     shifted,

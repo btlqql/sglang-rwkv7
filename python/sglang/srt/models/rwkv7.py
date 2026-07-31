@@ -2,11 +2,11 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 """RWKV-7 (Goose) model for sglang.
 
-All elementwise math (token-shift lerp, projections, LoRAs, gating, GroupNorm,
-gate-correction) is plain torch and matches the RWKV-LM numpy reference exactly; only
-the WKV recurrence runs in a dedicated Triton kernel (via Rwkv7AttnBackend). Module /
-parameter names mirror the fla-format checkpoint so `load_weights` uses
-`default_weight_loader` with no remapping.
+The portable path matches the RWKV-LM reference directly. Decode adds measured
+Triton fast paths for token-shift/control/gating math and a small-batch batched
+R/K/V projection, while retaining the canonical modules as universal fallbacks.
+The WKV recurrence runs in a dedicated backend kernel. Module and parameter
+names mirror the fla-format checkpoint, so ``load_weights`` needs no remapping.
 
 Quantization: the large r/k/v/o_proj and FFN key/value projections are SGLang
 quant-aware linears. RWKV-specific accuracy/balanced/speed policies choose
@@ -63,8 +63,11 @@ from sglang.srt.distributed.communication_op import (
 )
 from sglang.srt.layers.activation import ReLU2
 from sglang.srt.layers.attention.rwkv7_kernels.fused import (
+    can_fuse_lowrank_controls,
     fused_groupnorm_gate_corr,
     fused_kk_kmix,
+    fused_lowrank_controls,
+    is_profitable_fused_lowrank_shape,
 )
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -395,6 +398,24 @@ class Rwkv7Attention(nn.Module):
             add_prefix("o_proj", prefix),
             parallel="row",
         )
+        # The 1.5B decode shape is launch-bound: one strided-batched GEMM is
+        # measurably faster than three independent R/K/V GEMMs at B=1/2/4/8.
+        # Re-home the three canonical parameters as views into one storage so
+        # the fast path needs neither a per-forward stack nor a duplicate
+        # weight copy.  Checkpoint names and per-parameter weight loaders stay
+        # unchanged; in-place RL/weight updates update the shared storage too.
+        self._rkv_stacked_weight = None
+        self._rkv_pack_enabled = (
+            H == 2048
+            and _tp_size() == 1
+            and attention_quant_config is None
+            and all(
+                getattr(module, "weight", None) is not None and module.weight.ndim == 2
+                for module in (self.r_proj, self.k_proj, self.v_proj)
+            )
+        )
+        if self._rkv_pack_enabled:
+            self._pack_rkv_weights()
 
         low_rank_quant_config = quant_config
         if quant_config is not None and quant_config.get_name() in (
@@ -449,8 +470,42 @@ class Rwkv7Attention(nn.Module):
         )
 
         # Stacked token-shift mix vectors, lazily built (post weight-load)
-        # on first forward and cached. Order [x_r, x_k, x_w, x_a, x_g, x_v].
+        # on first forward and cached. R/K/V occupy the first three contiguous
+        # slices so the small-batch strided-batched projection consumes a view.
+        # Order [x_r, x_k, x_v, x_w, x_a, x_g].
         self._mix6 = None
+
+    def _pack_rkv_weights(self) -> None:
+        """Re-home canonical R/K/V parameters as views of one 3-D storage."""
+        modules = (self.r_proj, self.k_proj, self.v_proj)
+        original = [module.weight for module in modules]
+        base = torch.empty(
+            (3, *original[0].shape),
+            dtype=original[0].dtype,
+            device=original[0].device,
+        )
+        with torch.no_grad():
+            for old_weight, new_storage in zip(original, base):
+                new_storage.copy_(old_weight)
+        for module, old_weight, new_storage in zip(modules, original, base):
+            new_weight = nn.Parameter(
+                new_storage, requires_grad=old_weight.requires_grad
+            )
+            # Preserve SGLang's per-parameter weight-loader metadata.
+            new_weight.__dict__.update(old_weight.__dict__)
+            module.weight = new_weight
+        # A plain tensor attribute (not a parameter/buffer) owns the common
+        # 3-D view without adding a duplicate state-dict/load obligation.
+        self._rkv_stacked_weight = base
+
+    def _apply(self, fn, recurse=True):
+        # ``Module.to`` transforms registered parameters independently. Repack
+        # afterward so R/K/V retain shared storage instead of silently keeping
+        # an obsolete duplicate base and falling off the optimized path.
+        result = super()._apply(fn, recurse=recurse)
+        if self._rkv_pack_enabled:
+            self._pack_rkv_weights()
+        return result
 
     def _mix6_buf(self) -> torch.Tensor:
         if self._mix6 is None:
@@ -458,10 +513,10 @@ class Rwkv7Attention(nn.Module):
                 [
                     self.x_r.reshape(-1),
                     self.x_k.reshape(-1),
+                    self.x_v.reshape(-1),
                     self.x_w.reshape(-1),
                     self.x_a.reshape(-1),
                     self.x_g.reshape(-1),
-                    self.x_v.reshape(-1),
                 ],
                 dim=0,
             ).contiguous()
@@ -472,6 +527,7 @@ class Rwkv7Attention(nn.Module):
         forward_batch: ForwardBatch,
         x: torch.Tensor,
         v_first: Optional[torch.Tensor],
+        norm: Optional[nn.LayerNorm] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         T = x.shape[0]
         if T == 0:
@@ -488,10 +544,19 @@ class Rwkv7Attention(nn.Module):
 
         if fused:
             lp = be.token_shift_lerp6(
-                x, self._mix6_buf(), self.layer_id, 0, forward_batch
+                x,
+                self._mix6_buf(),
+                self.layer_id,
+                0,
+                forward_batch,
+                norm_weight=None if norm is None else norm.weight,
+                norm_bias=None if norm is None else norm.bias,
+                norm_eps=1e-5 if norm is None else norm.eps,
             )
-            xr, xk, xw, xa, xg, xv = lp[0], lp[1], lp[2], lp[3], lp[4], lp[5]
+            xr, xk, xv, xw, xa, xg = lp[0], lp[1], lp[2], lp[3], lp[4], lp[5]
         else:
+            if norm is not None:
+                x = norm(x)
             shifted = be.token_shift(x, self.layer_id, 0, forward_batch)
             d = shifted - x
             xr = x + self.x_r.view(-1) * d
@@ -501,19 +566,56 @@ class Rwkv7Attention(nn.Module):
             xa = x + self.x_a.view(-1) * d
             xg = x + self.x_g.view(-1) * d
 
-        r = self.r_proj(xr)[0]
-        k = self.k_proj(xk)[0]
-        v = self.v_proj(xv)[0]
+        stacked = self._rkv_stacked_weight
+        if (
+            stacked is not None
+            and fused
+            and T in (1, 2, 4, 8)
+            and stacked.device == xr.device
+            and stacked.dtype == xr.dtype
+            and self.r_proj.weight.data_ptr() == stacked[0].data_ptr()
+            and self.k_proj.weight.data_ptr() == stacked[1].data_ptr()
+            and self.v_proj.weight.data_ptr() == stacked[2].data_ptr()
+        ):
+            rkv = torch.bmm(lp[:3], stacked.transpose(1, 2))
+            r, k, v = rkv[0], rkv[1], rkv[2]
+        else:
+            r = self.r_proj(xr)[0]
+            k = self.k_proj(xk)[0]
+            v = self.v_proj(xv)[0]
 
         if self.layer_id == 0:
             v_first = v
 
-        # LoRA gates: w=decay, a=in-context-lr, g=output-gate, v=v-residual (layer>0).
-        w_log = -torch.sigmoid(self.w_lora(xw)) * _INV_SQRT_E
-        a = torch.sigmoid(self.a_lora(xa))
-        g = self.g_lora(xg)
-        if self.layer_id != 0:
-            v = v + (v_first - v) * torch.sigmoid(self.v_lora(xv))
+        # LoRA gates: w=decay, a=in-context-lr, g=output-gate, v=v-residual
+        # (layer>0). Decode batches <=8 use two grouped Triton launches while
+        # retaining separately named canonical weights and the generic path.
+        v_lora = self.v_lora if self.layer_id != 0 else None
+        use_fused_lowrank = (
+            fused
+            and is_profitable_fused_lowrank_shape(H, T)
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and can_fuse_lowrank_controls(self.w_lora, self.a_lora, self.g_lora, v_lora)
+        )
+        if use_fused_lowrank:
+            w_log, a, g, v = fused_lowrank_controls(
+                xw,
+                xa,
+                xg,
+                xv,
+                v,
+                v_first,
+                self.w_lora,
+                self.a_lora,
+                self.g_lora,
+                v_lora,
+            )
+        else:
+            w_log = -torch.sigmoid(self.w_lora(xw)) * _INV_SQRT_E
+            a = torch.sigmoid(self.a_lora(xa))
+            g = self.g_lora(xg)
+            if self.layer_id != 0:
+                v = v + (v_first - v) * torch.sigmoid(self.v_lora(xv))
 
         if fused:
             # kk = L2norm(k·k_k) over hd; k <- k + k·(a-1)·k_a  (one launch)
@@ -604,12 +706,25 @@ class Rwkv7FeedForward(nn.Module):
             parallel="row",
         )
 
-    def forward(self, forward_batch: ForwardBatch, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        forward_batch: ForwardBatch,
+        x: torch.Tensor,
+        norm: Optional[nn.LayerNorm] = None,
+    ) -> torch.Tensor:
         if x.shape[0] == 0:
             return x
         be = _linear_backend(forward_batch)
-        shifted = be.token_shift(x, self.layer_id, 1, forward_batch)
-        xk = x + self.x_k * (shifted - x)
+        xk = be.token_shift_lerp1(
+            x,
+            self.x_k,
+            self.layer_id,
+            1,
+            forward_batch,
+            norm_weight=None if norm is None else norm.weight,
+            norm_bias=None if norm is None else norm.bias,
+            norm_eps=1e-5 if norm is None else norm.eps,
+        )
         k = self.key(xk)[0]
         act = self.activation(k)
         out = self.value(act)[0]
@@ -653,9 +768,9 @@ class Rwkv7DecoderLayer(nn.Module):
         x: torch.Tensor,
         v_first: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        attn_out, v_first = self.attn(forward_batch, self.attn_norm(x), v_first)
+        attn_out, v_first = self.attn(forward_batch, x, v_first, norm=self.attn_norm)
         x = x + attn_out
-        x = x + self.ffn(forward_batch, self.ffn_norm(x))
+        x = x + self.ffn(forward_batch, x, norm=self.ffn_norm)
         return x, v_first
 
 

@@ -37,6 +37,7 @@ caller-allocated buffers.
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 
 # ----------------------------------------------------------------------------
@@ -348,3 +349,327 @@ def fused_groupnorm_gate_corr(
         enable_fp_fusion=False,
     )
     return out
+
+
+# ----------------------------------------------------------------------------
+# Kernels E/F: jointly evaluate the W/A/G/V low-rank control branches.
+#
+# Decode has four independent, poorly shaped low-rank MMs per half of the
+# control block.  At small batch sizes their launch cost is comparable to the
+# useful work.  The kernels below keep the canonical, separately named module
+# weights (so checkpoint loading, TP and weight updates retain their normal
+# contract), but dispatch all rank-in work in one launch and all rank-out work
+# in one launch.  No padded or transposed weight copy is materialized.
+# ----------------------------------------------------------------------------
+@triton.jit
+def _lowrank4_down_kernel(
+    xw_ptr,
+    xa_ptr,
+    xg_ptr,
+    xv_ptr,
+    ww_ptr,
+    wa_ptr,
+    wg_ptr,
+    wv_ptr,
+    out_ptr,
+    M: tl.constexpr,
+    H: tl.constexpr,
+    RW: tl.constexpr,
+    RA: tl.constexpr,
+    RG: tl.constexpr,
+    RV: tl.constexpr,
+    HAS_V: tl.constexpr,
+    BK: tl.constexpr,
+):
+    group = tl.program_id(0)
+    rank = tl.program_id(1)
+    k = tl.arange(0, BK)
+    mask = k < H
+    total_rank = RW + RA + RG + RV
+
+    if group == 0:
+        if rank < RW:
+            weight = tl.load(ww_ptr + rank * H + k, mask=mask, other=0.0).to(tl.float32)
+            for row in tl.static_range(M):
+                value = tl.load(xw_ptr + row * H + k, mask=mask, other=0.0).to(
+                    tl.float32
+                )
+                tl.store(
+                    out_ptr + row * total_rank + rank,
+                    tl.sum(value * weight, axis=0),
+                )
+    elif group == 1:
+        if rank < RA:
+            weight = tl.load(wa_ptr + rank * H + k, mask=mask, other=0.0).to(tl.float32)
+            for row in tl.static_range(M):
+                value = tl.load(xa_ptr + row * H + k, mask=mask, other=0.0).to(
+                    tl.float32
+                )
+                tl.store(
+                    out_ptr + row * total_rank + RW + rank,
+                    tl.sum(value * weight, axis=0),
+                )
+    elif group == 2:
+        if rank < RG:
+            weight = tl.load(wg_ptr + rank * H + k, mask=mask, other=0.0).to(tl.float32)
+            for row in tl.static_range(M):
+                value = tl.load(xg_ptr + row * H + k, mask=mask, other=0.0).to(
+                    tl.float32
+                )
+                tl.store(
+                    out_ptr + row * total_rank + RW + RA + rank,
+                    tl.sum(value * weight, axis=0),
+                )
+    elif HAS_V:
+        if rank < RV:
+            weight = tl.load(wv_ptr + rank * H + k, mask=mask, other=0.0).to(tl.float32)
+            for row in tl.static_range(M):
+                value = tl.load(xv_ptr + row * H + k, mask=mask, other=0.0).to(
+                    tl.float32
+                )
+                tl.store(
+                    out_ptr + row * total_rank + RW + RA + RG + rank,
+                    tl.sum(value * weight, axis=0),
+                )
+
+
+@triton.jit
+def _lowrank4_up_kernel(
+    rank_ptr,
+    ww_ptr,
+    wa_ptr,
+    wg_ptr,
+    wv_ptr,
+    bw_ptr,
+    ba_ptr,
+    bv_ptr,
+    value_ptr,
+    v_first_ptr,
+    out_ptr,
+    M: tl.constexpr,
+    H: tl.constexpr,
+    RW: tl.constexpr,
+    RA: tl.constexpr,
+    RG: tl.constexpr,
+    RV: tl.constexpr,
+    HAS_V: tl.constexpr,
+    BR: tl.constexpr,
+):
+    group = tl.program_id(0)
+    channel = tl.program_id(1)
+    rank = tl.arange(0, BR)
+    total_rank = RW + RA + RG + RV
+    DT = out_ptr.dtype.element_ty
+
+    if group == 0:
+        mask = rank < RW
+        weight = tl.load(ww_ptr + channel * RW + rank, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        for row in tl.static_range(M):
+            control = tl.load(
+                rank_ptr + row * total_rank + rank, mask=mask, other=0.0
+            ).to(tl.float32)
+            # The rank-in linear returns the storage dtype before tanh.
+            control = control.to(DT).to(tl.float32)
+            control = libdevice.tanh(control).to(DT).to(tl.float32)
+            raw = tl.sum(control * weight, axis=0)
+            raw += tl.load(bw_ptr + channel).to(tl.float32)
+            # Rank-out+bias rounds before the outer sigmoid and scale.
+            raw = raw.to(DT).to(tl.float32)
+            gate = (1.0 / (1.0 + tl.exp(-raw))).to(DT).to(tl.float32)
+            gate = (-gate).to(DT).to(tl.float32)
+            result = (gate * 0.6065306597126334).to(DT)
+            tl.store(out_ptr + row * H + channel, result)
+    elif group == 1:
+        mask = rank < RA
+        weight = tl.load(wa_ptr + channel * RA + rank, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        for row in tl.static_range(M):
+            control = tl.load(
+                rank_ptr + row * total_rank + RW + rank,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
+            control = control.to(DT).to(tl.float32)
+            raw = tl.sum(control * weight, axis=0)
+            raw += tl.load(ba_ptr + channel).to(tl.float32)
+            raw = raw.to(DT).to(tl.float32)
+            result = (1.0 / (1.0 + tl.exp(-raw))).to(DT)
+            tl.store(out_ptr + (M + row) * H + channel, result)
+    elif group == 2:
+        mask = rank < RG
+        weight = tl.load(wg_ptr + channel * RG + rank, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        for row in tl.static_range(M):
+            control = tl.load(
+                rank_ptr + row * total_rank + RW + RA + rank,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
+            control = control.to(DT).to(tl.float32)
+            control = (1.0 / (1.0 + tl.exp(-control))).to(DT).to(tl.float32)
+            result = tl.sum(control * weight, axis=0).to(DT)
+            tl.store(out_ptr + (2 * M + row) * H + channel, result)
+    elif HAS_V:
+        mask = rank < RV
+        weight = tl.load(wv_ptr + channel * RV + rank, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        for row in tl.static_range(M):
+            control = tl.load(
+                rank_ptr + row * total_rank + RW + RA + RG + rank,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
+            control = control.to(DT).to(tl.float32)
+            raw = tl.sum(control * weight, axis=0)
+            raw += tl.load(bv_ptr + channel).to(tl.float32)
+            raw = raw.to(DT).to(tl.float32)
+            gate = (1.0 / (1.0 + tl.exp(-raw))).to(DT).to(tl.float32)
+            value = tl.load(value_ptr + row * H + channel).to(tl.float32)
+            v_first = tl.load(v_first_ptr + row * H + channel).to(tl.float32)
+            delta = (v_first - value).to(DT).to(tl.float32)
+            update = (delta * gate).to(DT).to(tl.float32)
+            result = (value + update).to(DT)
+            tl.store(out_ptr + (3 * M + row) * H + channel, result)
+
+
+def _plain_linear_weight(module):
+    weight = getattr(module, "weight", None)
+    if (
+        weight is None
+        or weight.ndim != 2
+        or not weight.is_contiguous()
+        or weight.dtype not in (torch.float16, torch.bfloat16)
+    ):
+        return None
+    return weight
+
+
+def can_fuse_lowrank_controls(w_lora, a_lora, g_lora, v_lora=None) -> bool:
+    """Return whether four canonical dense RWKV low-rank modules are fusible."""
+    modules = [w_lora, a_lora, g_lora]
+    if v_lora is not None:
+        modules.append(v_lora)
+    for module in modules:
+        if len(module.lora) != 3:
+            return False
+        down = _plain_linear_weight(module.lora[0])
+        up = _plain_linear_weight(module.lora[2])
+        if (
+            down is None
+            or up is None
+            or down.shape[0] != up.shape[1]
+            or down.device != up.device
+            or down.dtype != up.dtype
+        ):
+            return False
+    # W and A require rank-out biases. V does too when that branch exists;
+    # G is intentionally bias-free in the canonical RWKV-7 checkpoint.
+    if w_lora.lora[2].bias is None or a_lora.lora[2].bias is None:
+        return False
+    if v_lora is not None and v_lora.lora[2].bias is None:
+        return False
+    return True
+
+
+def is_profitable_fused_lowrank_shape(hidden_size: int, num_tokens: int) -> bool:
+    """Conservative measured dispatch policy for the grouped decode kernel.
+
+    The no-copy kernel wins for all decode batches through hidden size 2560.
+    At hidden size 4096 it still wins for B=1/2/4, while B=8 has enough GEMM
+    work for the canonical modules to be faster on Ada. Unknown larger shapes
+    stay on the portable module path until they have hardware evidence.
+    """
+    return num_tokens in (1, 2, 4, 8) and (
+        hidden_size <= 2560 or (hidden_size <= 4096 and num_tokens <= 4)
+    )
+
+
+def fused_lowrank_controls(
+    xw,
+    xa,
+    xg,
+    xv,
+    value,
+    v_first,
+    w_lora,
+    a_lora,
+    g_lora,
+    v_lora=None,
+):
+    """Evaluate W/A/G[/V] controls in two launches for decode batches <= 8.
+
+    Returns already activated ``w_log``, ``a``, ``g`` and (when ``v_lora`` is
+    present) the value-residual-mixed ``v``.  The caller owns dispatch and keeps
+    the ordinary module path as the universal fallback.
+    """
+    inputs = (xw, xa, xg, xv)
+    if any(not tensor.is_contiguous() for tensor in inputs):
+        inputs = tuple(tensor.contiguous() for tensor in inputs)
+    M, hidden = xw.shape
+    modules = (w_lora, a_lora, g_lora, v_lora)
+    has_v = v_lora is not None
+    downs = [module.lora[0].weight for module in modules if module is not None]
+    ups = [module.lora[2].weight for module in modules if module is not None]
+    ranks = [weight.shape[0] for weight in downs]
+    if not has_v:
+        ranks.append(0)
+        # Triton still requires valid pointers for compile-time-dead operands.
+        downs.append(downs[0])
+        ups.append(ups[0])
+    rw, ra, rg, rv = ranks
+    rank_values = torch.empty((M, rw + ra + rg + rv), dtype=xw.dtype, device=xw.device)
+    _lowrank4_down_kernel[(4, max(ranks))](
+        *inputs,
+        *downs,
+        rank_values,
+        M=M,
+        H=hidden,
+        RW=rw,
+        RA=ra,
+        RG=rg,
+        RV=rv,
+        HAS_V=has_v,
+        BK=triton.next_power_of_2(hidden),
+        num_warps=4 if hidden <= 2560 else 8,
+        num_stages=1,
+    )
+
+    bw = w_lora.lora[2].bias
+    ba = a_lora.lora[2].bias
+    bv = bw if not has_v else v_lora.lora[2].bias
+    if bw is None or ba is None or (has_v and bv is None):
+        raise ValueError("RWKV-7 fused low-rank controls require W/A/V biases")
+    if not has_v:
+        v_first = value
+    outputs = torch.empty(
+        (4 if has_v else 3, M, hidden), dtype=xw.dtype, device=xw.device
+    )
+    _lowrank4_up_kernel[(4, hidden)](
+        rank_values,
+        *ups,
+        bw,
+        ba,
+        bv,
+        value,
+        v_first,
+        outputs,
+        M=M,
+        H=hidden,
+        RW=rw,
+        RA=ra,
+        RG=rg,
+        RV=rv,
+        HAS_V=has_v,
+        BR=triton.next_power_of_2(max(ranks)),
+        num_warps=4,
+        num_stages=1,
+        enable_fp_fusion=False,
+    )
+    if has_v:
+        return outputs[0], outputs[1], outputs[2], outputs[3]
+    return outputs[0], outputs[1], outputs[2], value

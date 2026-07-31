@@ -6,19 +6,27 @@ from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
+from torch import nn
 
+from sglang.srt.configs.rwkv7 import Rwkv7Config
 from sglang.srt.layers.attention.rwkv7_kernels import (
+    layernorm_token_shift_lerp1_decode,
+    layernorm_token_shift_lerp6_decode,
     token_shift_lerp6_decode,
     token_shift_lerp6_packed_varlen,
     token_shift_packed_varlen,
     wkv_recurrent,
 )
 from sglang.srt.layers.attention.rwkv7_kernels.fused import (
+    can_fuse_lowrank_controls,
     fused_gate_corr,
     fused_groupnorm_gate_corr,
     fused_kk_kmix,
     fused_lerp6,
+    fused_lowrank_controls,
+    is_profitable_fused_lowrank_shape,
 )
+from sglang.srt.models.rwkv7 import Rwkv7Attention
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
@@ -488,6 +496,141 @@ class TestRwkv7Kernels(unittest.TestCase):
         # fused kernel remains within the same low-precision tolerance used by
         # the recurrent kernel and is covered by the end-to-end logit gate.
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+    def test_fused_lowrank_controls_match_canonical_modules(self):
+        class LowRank(nn.Module):
+            def __init__(self, hidden, rank, activation, bias):
+                super().__init__()
+                self.lora = nn.Sequential(
+                    nn.Linear(hidden, rank, bias=False),
+                    activation,
+                    nn.Linear(rank, hidden, bias=bias),
+                ).to(device="cuda", dtype=torch.float16)
+
+            def forward(self, value):
+                return self.lora(value)
+
+        hidden = 256
+        ranks = (24, 24, 64, 16)
+        w_lora = LowRank(hidden, ranks[0], nn.Tanh(), True)
+        a_lora = LowRank(hidden, ranks[1], nn.Identity(), True)
+        g_lora = LowRank(hidden, ranks[2], nn.Sigmoid(), False)
+        v_lora = LowRank(hidden, ranks[3], nn.Identity(), True)
+        self.assertTrue(can_fuse_lowrank_controls(w_lora, a_lora, g_lora, v_lora))
+
+        for batch in (1, 8):
+            inputs = [
+                torch.randn(batch, hidden, device="cuda", dtype=torch.float16)
+                for _ in range(4)
+            ]
+            value = torch.randn_like(inputs[0])
+            v_first = torch.randn_like(value)
+            expected_w = -torch.sigmoid(w_lora(inputs[0])) * (2.718281828459045**-0.5)
+            expected_a = torch.sigmoid(a_lora(inputs[1]))
+            expected_g = g_lora(inputs[2])
+            expected_v = value + (v_first - value) * torch.sigmoid(v_lora(inputs[3]))
+            actual = fused_lowrank_controls(
+                *inputs,
+                value,
+                v_first,
+                w_lora,
+                a_lora,
+                g_lora,
+                v_lora,
+            )
+            for result, expected in zip(
+                actual, (expected_w, expected_a, expected_g, expected_v)
+            ):
+                torch.testing.assert_close(result, expected, rtol=2e-2, atol=2e-2)
+
+        actual_w, actual_a, actual_g, actual_v = fused_lowrank_controls(
+            *inputs,
+            value,
+            v_first,
+            w_lora,
+            a_lora,
+            g_lora,
+        )
+        torch.testing.assert_close(actual_v, value, rtol=0, atol=0)
+        torch.testing.assert_close(
+            actual_w,
+            -torch.sigmoid(w_lora(inputs[0])) * (2.718281828459045**-0.5),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+        torch.testing.assert_close(
+            actual_a, torch.sigmoid(a_lora(inputs[1])), rtol=2e-2, atol=2e-2
+        )
+        torch.testing.assert_close(actual_g, g_lora(inputs[2]), rtol=2e-2, atol=2e-2)
+
+    def test_fused_lowrank_dispatch_policy(self):
+        for batch in (1, 2, 4, 8):
+            self.assertTrue(is_profitable_fused_lowrank_shape(2048, batch))
+            self.assertTrue(is_profitable_fused_lowrank_shape(2560, batch))
+        self.assertTrue(is_profitable_fused_lowrank_shape(4096, 4))
+        self.assertFalse(is_profitable_fused_lowrank_shape(4096, 8))
+        self.assertFalse(is_profitable_fused_lowrank_shape(5120, 1))
+        self.assertFalse(is_profitable_fused_lowrank_shape(2048, 16))
+
+    def test_layernorm_token_shift_mix_decode_matches_torch(self):
+        batch, hidden, slots = 8, 256, 16
+        x = torch.randn(batch, hidden, device="cuda", dtype=torch.float16)
+        conv = torch.randn(slots, hidden, 1, device="cuda", dtype=torch.float32)
+        mix6 = torch.randn(6, hidden, device="cuda", dtype=torch.float16)
+        weight = torch.randn(hidden, device="cuda", dtype=torch.float16)
+        bias = torch.randn(hidden, device="cuda", dtype=torch.float16)
+        indices = torch.arange(1, batch + 1, device="cuda", dtype=torch.int32)
+
+        normalized = F.layer_norm(x, (hidden,), weight, bias, 1e-5)
+        shifted = conv[indices.long(), :, 0].to(x.dtype)
+        delta = shifted - normalized
+        expected6 = torch.stack([normalized + mix6[i] * delta for i in range(6)], dim=0)
+        conv6 = conv.clone()
+        actual6 = layernorm_token_shift_lerp6_decode(
+            x, conv6, mix6, weight, bias, 1e-5, indices
+        )
+        torch.testing.assert_close(actual6, expected6, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(
+            conv6[indices.long(), :, 0], normalized.float(), rtol=2e-2, atol=2e-2
+        )
+
+        mix1 = mix6[0]
+        expected1 = normalized + mix1 * delta
+        conv1 = conv.clone()
+        actual1 = layernorm_token_shift_lerp1_decode(
+            x, conv1, mix1, weight, bias, 1e-5, indices
+        )
+        torch.testing.assert_close(actual1, expected1, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(
+            conv1[indices.long(), :, 0], normalized.float(), rtol=2e-2, atol=2e-2
+        )
+
+    def test_rkv_stacked_storage_survives_dtype_apply(self):
+        config = Rwkv7Config(
+            hidden_size=2048,
+            num_hidden_layers=2,
+            head_dim=64,
+            num_heads=32,
+            intermediate_size=4096,
+        )
+        with torch.device("cuda"):
+            attention = Rwkv7Attention(config, layer_id=0)
+        attention = attention.to(dtype=torch.float16)
+
+        stacked = attention._rkv_stacked_weight
+        modules = (attention.r_proj, attention.k_proj, attention.v_proj)
+        self.assertIsNotNone(stacked)
+        for index, module in enumerate(modules):
+            self.assertEqual(module.weight.data_ptr(), stacked[index].data_ptr())
+            self.assertTrue(hasattr(module.weight, "weight_loader"))
+        self.assertTrue(
+            {"r_proj.weight", "k_proj.weight", "v_proj.weight"}.issubset(
+                attention.state_dict()
+            )
+        )
+
+        attention.k_proj.weight.data.fill_(3)
+        self.assertEqual(float(stacked[1, 0, 0]), 3.0)
 
 
 if __name__ == "__main__":
