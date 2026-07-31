@@ -214,7 +214,7 @@ Raw evidence:
 
 #### 512-token prefill cutoff update (`97116ffb`)
 
-The same safety policy was retuned so packed Marlin/native W8 takes over above
+The same safety policy was tuned so packed Marlin/native W8 takes over above
 512 tokens rather than above 1,024. This configuration was measured on
 `862f6328` and promoted as the default by `97116ffb`. It retains the 5.00 GB
 model-weight load and the same strict alignment/lifecycle results while
