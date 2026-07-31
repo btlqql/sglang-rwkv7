@@ -5,8 +5,9 @@ Date: 2026-07-31
 This page records the current Ada optimization slice. It is intentionally
 narrower than the full acceptance contract in `RWKV7_HF_PARITY.md`: complete
 1.5B and 2.9B dense/W8/W4 batch matrices, production-safe W8/W4 batch-8
-capacity lanes for 7.2B, and one RTX 4080. It is an engineering snapshot, not
-a claim that the multi-hardware matrix is complete.
+capacity lanes for 7.2B, a 1.5B STANDALONE speculative batch-8 matrix, and one
+RTX 4080. It is an engineering snapshot, not a claim that the multi-hardware
+matrix is complete.
 
 The matched dense/W8/W4 raw JSONL, alignment output, serving-feature output,
 and public environment manifest are stored under
@@ -131,6 +132,39 @@ Batch-8 result:
   Its minimum gains are 12.9% prefill, 6.8% decode, and 6.8% end to end.
 - W4 hybrid accuracy is also faster in all 18 gates. Its minimum gains are
   2.3% prefill, 14.0% decode, and 12.7% end to end.
+
+## STANDALONE speculative batch-8 lane (`8c1ca1e`)
+
+This lane pairs the 1.5B target with the 0.4B RWKV draft at topk 1, three draft
+steps, and four verify tokens. Target verify, multi-step draft decode, and the
+fixed-width draft-extend pass all use CUDA Graphs. The server is configured
+with `max_running_requests=8` and `max_mamba_cache_size=24`; the latter is
+required because speculation reserves three recurrent state paths per active
+request. A value of 16 silently limits effective concurrency to five.
+
+The paired harness sends identical deterministic fixed-token batches to
+non-speculative and speculative endpoints, flushes recurrent radix state before
+each sample, and requires exact greedy output IDs. This slice uses one warm-up
+and the median of three measurements per endpoint and cell.
+
+| Prompt | Decode | Accept length | Prefill / baseline | Decode / baseline | E2E / baseline | Exact |
+| ---: | ---: | ---: | ---: | ---: | ---: | :---: |
+| 128 | 128 | 3.346 | 0.729x | 0.832x | 0.826x | yes |
+| 128 | 512 | 3.768 | 0.725x | 1.013x | 1.007x | yes |
+| 512 | 128 | 2.934 | 0.724x | 0.633x | 0.648x | yes |
+| 512 | 512 | 3.552 | 0.699x | 0.939x | 0.922x | yes |
+| 2048 | 128 | 3.272 | 0.670x | 0.859x | 0.749x | yes |
+| 2048 | 512 | 3.641 | 0.664x | 0.988x | 0.896x | yes |
+
+The 128/512 cell crosses both decode and end-to-end parity. The other five
+decode cells remain below parity, so this result is evidence that the captured
+draft-extend path works and can pay off at high acceptance, not a claim that
+speculation is universally faster. Prefill remains below the single-model
+baseline because STANDALONE must prefill both target and draft models.
+
+Raw evidence:
+
+- `rwkv7-g1-1.5b/standalone-spec-b8-draft-extend-cg-8c1ca1e.jsonl`
 
 ### 1.5B production-safe W4 batch-8 slice (`97116ffb`)
 
@@ -406,3 +440,5 @@ llama.cpp-quality quantization parity.
 4. Repeat the 7.2B lane on a 24 GB card with dense, Albatross batch-8, and
    same-runtime Qwen3.5-9B baselines; the 16 GB quantized split-graph matrix is
    complete.
+5. Raise short-window STANDALONE acceptance or reduce target/draft orchestration
+   cost so every speculative decode cell clears the non-speculative baseline.
