@@ -17,9 +17,10 @@ serving-feature gate.
 For 1.5B, W8 is at least 1.048x/1.053x/1.054x dense for prefill/decode/E2E;
 W4 is at least 1.023x/1.139x/1.127x. For 2.9B, those minima are
 1.091x/1.094x/1.094x and 1.087x/1.231x/1.179x. Quantized alignment passes for
-both models, and 7.2B W4 alignment also passes. Fresh same-runtime Qwen3.5 and
-full Albatross artifacts retain the remaining red cells. These measurements
-still represent one GPU rather than the full multi-hardware acceptance matrix.
+both models. Production-safe 7.2B W4 and W8 batch-8 capacity lanes now also
+pass alignment and serving-lifecycle gates. Fresh same-runtime Qwen3.5 and full
+Albatross artifacts retain the remaining red cells. These measurements still
+represent one GPU rather than the full multi-hardware acceptance matrix.
 
 The first matrix command accidentally supplied the Albatross commit in the
 `standard_sha` field. The checked-in JSONL corrects that metadata to the pinned
@@ -59,3 +60,24 @@ For 2.9B, minimum ratios are 1.188x/1.088x/1.094x versus matched dense,
 5.68 GB dense. Strict teacher-forced alignment and all production lifecycle
 checks pass; its serving artifact retains the explicit two-token synthetic
 repeat-prefix disclosure.
+
+## 7.2B batch-8 capacity update
+
+The `w4-hybrid-safe-th512-8fa6e43*` and
+`w8-accuracy-fp32-th512-8fa6e43*` artifacts under `rwkv7-g1-7.2b` complete the
+six 128/512/2048 prefill by 128/512 decode cells at batch 8. Short prefills use
+exact fixed-shape full-prefill graphs; the 2,048-token-per-request cells use
+eager prefill because a 16,384-token graph exceeds the 16 GB budget by about
+192 MiB. Every decode cell uses a batch-8 full CUDA Graph.
+
+W4 loads at 11.58 GB and sustains 392.8-393.2 decode tok/s. W8 with strict FP32
+recurrent state loads at 11.56 GB and sustains 377.9-378.4 decode tok/s. Both
+alignment reports pass. W4 reproduces all four natural 32-token references;
+W8 reaches 1.0000 teacher-forced top-1 agreement. Both pass cache restore,
+dynamic batching, compaction, abort, and post-abort slot reuse; W8 additionally
+passes the complete deterministic synthetic serving gate.
+
+The 16 GB card cannot host the dense 7.2B production matrix, a complete
+Albatross batch-8 matrix, or a same-runtime Qwen3.5-9B baseline. Those
+cross-model comparisons remain explicitly assigned to the 24 GB acceptance
+lane rather than inferred from smaller batches.

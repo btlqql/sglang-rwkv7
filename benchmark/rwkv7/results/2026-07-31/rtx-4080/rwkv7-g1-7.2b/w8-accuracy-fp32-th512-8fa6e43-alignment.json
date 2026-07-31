@@ -1,0 +1,61 @@
+{
+  "schema": "rwkv7-quant-alignment-v1",
+  "model": "rwkv7-g1h-7.2b-hf-converted",
+  "dtype": "float16",
+  "max_new_tokens": 32,
+  "top_k": 10,
+  "thresholds": {
+    "max_token_logprob_error": 0.25,
+    "min_top_k_overlap": 0.8,
+    "min_top1_agreement": 0.9
+  },
+  "passed": true,
+  "summary": {
+    "max_token_logprob_error": 0.11125218868255615,
+    "mean_token_logprob_error": 0.018683181872432897,
+    "mean_top_k_overlap": 0.9625,
+    "teacher_forced_top1_agreement": 1.0
+  },
+  "results": [
+    {
+      "prompt": "The capital of France is",
+      "tokens": 32,
+      "max_token_logprob_error": 0.11125218868255615,
+      "mean_token_logprob_error": 0.015707390168245183,
+      "mean_top_k_overlap": 0.95625,
+      "teacher_forced_top1_agreement": 1.0,
+      "free_running_matching_prefix": 32,
+      "free_running_exact": true
+    },
+    {
+      "prompt": "1 + 2 + 3 + 4 + 5 =",
+      "tokens": 32,
+      "max_token_logprob_error": 0.09963500499725342,
+      "mean_token_logprob_error": 0.01816399633207766,
+      "mean_top_k_overlap": 0.96875,
+      "teacher_forced_top1_agreement": 1.0,
+      "free_running_matching_prefix": 32,
+      "free_running_exact": true
+    },
+    {
+      "prompt": "Once upon a time, in a small village by the sea,",
+      "tokens": 32,
+      "max_token_logprob_error": 0.09929442405700684,
+      "mean_token_logprob_error": 0.02656872277327693,
+      "mean_top_k_overlap": 0.96875,
+      "teacher_forced_top1_agreement": 1.0,
+      "free_running_matching_prefix": 24,
+      "free_running_exact": false
+    },
+    {
+      "prompt": "The quick brown fox",
+      "tokens": 32,
+      "max_token_logprob_error": 0.06757596135139465,
+      "mean_token_logprob_error": 0.014292618216131814,
+      "mean_top_k_overlap": 0.95625,
+      "teacher_forced_top1_agreement": 1.0,
+      "free_running_matching_prefix": 10,
+      "free_running_exact": false
+    }
+  ]
+}

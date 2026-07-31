@@ -4,9 +4,9 @@ Date: 2026-07-31
 
 This page records the current Ada optimization slice. It is intentionally
 narrower than the full acceptance contract in `RWKV7_HF_PARITY.md`: complete
-1.5B and 2.9B dense/W8/W4 batch matrices, a partial 7.2B capacity lane, and one
-RTX 4080. It is an engineering snapshot, not a claim that the multi-hardware
-matrix is complete.
+1.5B and 2.9B dense/W8/W4 batch matrices, production-safe W8/W4 batch-8
+capacity lanes for 7.2B, and one RTX 4080. It is an engineering snapshot, not
+a claim that the multi-hardware matrix is complete.
 
 The matched dense/W8/W4 raw JSONL, alignment output, serving-feature output,
 and public environment manifest are stored under
@@ -15,7 +15,7 @@ strict FP32-state evidence remains under `results/2026-07-30/rtx-4080`.
 
 ## Workload
 
-- models: RWKV-7 G1 1.5B and 2.9B; 7.2B quantized capacity work is in progress;
+- models: RWKV-7 G1 1.5B and 2.9B, plus 7.2B quantized batch-8 capacity lanes;
 - device: NVIDIA GeForce RTX 4080, 16 GB;
 - activation dtype: FP16;
 - batch sizes: 1, 2, 4, and 8;
@@ -245,12 +245,56 @@ Raw evidence:
 
 ## 7.2B quantized capacity lane
 
-The 16 GB card cannot host the dense 7.2B production graph matrix, so dense
-speed parity remains a 24 GB card requirement. W4 hybrid loads at 9.71 GB and
-passes the split-reference alignment gate with 0.3455 maximum chosen-token
-logprob error, 0.9203 mean top-10 overlap, and 0.9766 teacher-forced top-1
-agreement. W8 loads at 11.56 GB; its corrected state-pool configuration and
-split-graph performance run remain in progress.
+The 16 GB card cannot host the dense 7.2B production graph matrix, so dense,
+complete Albatross batch-8, and same-runtime Qwen3.5-9B speed parity remain
+24 GB card requirements. The
+production-safe W4 policy loads at 11.58 GB, including the FP16 fallback shards
+that make small projection batches invariant. W8 accuracy loads at 11.56 GB.
+Both fit a real 32-slot recurrent state pool and `max_running_requests=8`.
+
+The batch-8 matrix uses exact 1,024/4,096-token full-prefill graphs for the
+128/512-token-per-request cells. A full 16,384-token prefill graph misses the
+16 GB budget by about 192 MiB, so the 2,048-token-per-request cells use eager
+prefill. Decode uses a full batch-8 CUDA Graph in every cell. Each result still
+uses two warm-ups and the median of five clean samples.
+
+| Prompt | Decode | Mode | Prefill tok/s | Decode tok/s | E2E tok/s |
+| ---: | ---: | --- | ---: | ---: | ---: |
+| 128 | 128 | W4 safe, FP16 state | 6,820.7 | 392.8 | 374.2 |
+| 128 | 512 | W4 safe, FP16 state | 6,811.5 | 393.1 | 388.3 |
+| 512 | 128 | W4 safe, FP16 state | 7,197.2 | 393.1 | 324.7 |
+| 512 | 512 | W4 safe, FP16 state | 7,189.9 | 393.2 | 373.5 |
+| 2048 | 128 | W4 safe, FP16 state | 7,412.0 | 393.0 | 213.5 |
+| 2048 | 512 | W4 safe, FP16 state | 7,415.5 | 393.1 | 324.8 |
+| 128 | 128 | W8 accuracy, FP32 state | 5,803.0 | 377.9 | 357.5 |
+| 128 | 512 | W8 accuracy, FP32 state | 5,809.4 | 378.1 | 372.7 |
+| 512 | 128 | W8 accuracy, FP32 state | 6,130.9 | 378.0 | 305.2 |
+| 512 | 512 | W8 accuracy, FP32 state | 6,126.0 | 378.1 | 356.8 |
+| 2048 | 128 | W8 accuracy, FP32 state | 6,287.0 | 378.4 | 193.5 |
+| 2048 | 512 | W8 accuracy, FP32 state | 6,280.6 | 378.3 | 305.4 |
+
+W4 passes the strict alignment gate with 0.1527 maximum chosen-token logprob
+error, 0.9688 mean top-10 overlap, and 0.9844 teacher-forced top-1 agreement.
+All four natural-prompt continuations reproduce the dense 32-token reference.
+Its serving report passes dynamic-batch isolation, cold/warm chunked prefill,
+a 128-token state-cache hit, compaction, abort, and post-abort reuse; the
+synthetic duplicate/repeat check uses the disclosed two-token prefix gate.
+
+W8 uses FP32 recurrent state for the strict cache lane. It passes at 0.1113
+maximum logprob error, 0.9625 top-10 overlap, and 1.0000 teacher-forced top-1
+agreement. Its serving report passes full deterministic replay, four-token
+single-vs-batch equality, dynamic-batch isolation, chunked prefill, the
+128-token cache hit, compaction, abort, and post-abort reuse without a shortened
+repeat-prefix gate.
+
+Raw evidence:
+
+- `rwkv7-g1-7.2b/w4-hybrid-safe-th512-8fa6e43.jsonl`
+- `rwkv7-g1-7.2b/w4-hybrid-safe-th512-8fa6e43-alignment.json`
+- `rwkv7-g1-7.2b/w4-hybrid-safe-th512-8fa6e43-serving.json`
+- `rwkv7-g1-7.2b/w8-accuracy-fp32-th512-8fa6e43.jsonl`
+- `rwkv7-g1-7.2b/w8-accuracy-fp32-th512-8fa6e43-alignment.json`
+- `rwkv7-g1-7.2b/w8-accuracy-fp32-th512-8fa6e43-serving.json`
 
 ## Prior strict FP32-state W8 lane
 
@@ -335,5 +379,6 @@ llama.cpp-quality quantization parity.
 2. Amortize the decode host loop with matched continuous-step runs and close
    the remaining Albatross B1/2/4 and Qwen3.5 active-work gaps.
 3. Close short-prefill red cells without weakening chunked-prefill handoff.
-4. Complete the running 2.9B/7.2B Albatross, Qwen3.5, and 7.2B split-graph
-   matrices.
+4. Repeat the 7.2B lane on a 24 GB card with dense, Albatross batch-8, and
+   same-runtime Qwen3.5-9B baselines; the 16 GB quantized split-graph matrix is
+   complete.
