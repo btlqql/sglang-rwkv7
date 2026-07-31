@@ -2,19 +2,18 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 """RWKV-7 (Goose) model for sglang.
 
-All elementwise math (token-shift lerp, projections, LoRAs, gating, GroupNorm,
-gate-correction) is plain torch and matches the RWKV-LM numpy reference exactly; only
-the WKV recurrence runs in a dedicated Triton kernel (via Rwkv7AttnBackend). Module /
-parameter names mirror the fla-format checkpoint so `load_weights` uses
-`default_weight_loader` with no remapping.
+The portable path matches the RWKV-LM reference directly. Decode adds measured
+Triton fast paths for token-shift/control/gating math and a small-batch batched
+R/K/V projection, while retaining the canonical modules as universal fallbacks.
+The WKV recurrence runs in a dedicated backend kernel. Module and parameter
+names mirror the fla-format checkpoint, so ``load_weights`` needs no remapping.
 
-Quantization: the linear projections (r/k/v/o_proj, ffn key/value) and the
-LoRA down/up projections are sglang quant-aware `ReplicatedLinear` (tp=1) threaded
-with `quant_config`. With `quant_config=None` they are unquantized `F.linear`
-(bit-identical to the previous `nn.Linear`, so greedy stays EXACT); quantized
-configs carry their quantized weights through the same modules. The WKV
-recurrence/state and the small per-channel params (x_*, k_k, k_a, r_k, g_norm)
-are never quantized — they stay bf16/fp32.
+Quantization: the large r/k/v/o_proj and FFN key/value projections are SGLang
+quant-aware linears. RWKV-specific accuracy/balanced/speed policies choose
+which of those projections are quantized. Online W8/W4 and BitsAndBytes keep
+low-rank controls and lm_head dense because their small or poorly shaped GEMMs
+add error/latency for little memory benefit. The WKV recurrence/state and
+per-channel parameters (x_*, k_k, k_a, r_k, g_norm) are never weight-quantized.
 
 Tensor parallelism is head-parallel: head_dim stays whole and whole heads are
 split across ranks (r/k/v + LoRA-up column-parallel with no gather, per-channel
@@ -47,6 +46,7 @@ Channel-mix (ffn): shifted=prev(x); xk = x + x_k·(shifted-x); out = value(relu(
 """
 
 import logging
+import os
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
@@ -61,10 +61,13 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_gather,
 )
+from sglang.srt.layers.activation import ReLU2
 from sglang.srt.layers.attention.rwkv7_kernels.fused import (
-    fused_gate_corr,
+    can_fuse_lowrank_controls,
+    fused_groupnorm_gate_corr,
     fused_kk_kmix,
-    fused_lerp6,
+    fused_lowrank_controls,
+    is_profitable_fused_lowrank_shape,
 )
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -88,7 +91,9 @@ from sglang.srt.utils import add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
 
+_RWKV7_W8A8_CONFIG: Optional[QuantizationConfig] = None
 _online_marlin_quantize_weight = None
+_online_marlin_quantize_weight_with_int8_shadow = None
 if (
     torch.cuda.is_available()
     and torch.version.hip is None
@@ -96,6 +101,9 @@ if (
 ):
     from sglang.srt.layers.quantization.marlin_utils import (
         online_marlin_quantize_weight as _online_marlin_quantize_weight,
+    )
+    from sglang.srt.layers.quantization.marlin_utils import (
+        online_marlin_quantize_weight_with_int8_shadow as _online_marlin_quantize_weight_with_int8_shadow,
     )
 
 
@@ -117,6 +125,145 @@ def _tp_rank() -> int:
 
 # e^-0.5 = 1/sqrt(e); w_log = -this * sigmoid(w_raw)  =>  decay = exp(w_log).
 _INV_SQRT_E = 0.6065306597126334
+
+
+def _rwkv7_w8_policy() -> str:
+    """Select the model-specific online W8A8 accuracy/compression trade-off."""
+    policy = os.getenv("SGLANG_RWKV7_W8_POLICY", "accuracy").lower()
+    if policy not in ("accuracy", "balanced", "speed"):
+        raise ValueError(
+            "SGLANG_RWKV7_W8_POLICY must be accuracy, balanced, or speed; "
+            f"got {policy!r}."
+        )
+    return policy
+
+
+def _rwkv7_w4_policy() -> str:
+    """Select the model-specific online Marlin accuracy/compression trade-off."""
+    policy = os.getenv("SGLANG_RWKV7_W4_POLICY", "accuracy").lower()
+    if policy not in ("accuracy", "balanced", "speed"):
+        raise ValueError(
+            "SGLANG_RWKV7_W4_POLICY must be accuracy, balanced, or speed; "
+            f"got {policy!r}."
+        )
+    return policy
+
+
+def _rwkv7_marlin_fallback_max_tokens() -> int:
+    """Token-count limit for the batch-invariant W4 accuracy shadow."""
+    raw = os.getenv("SGLANG_RWKV7_MARLIN_FALLBACK_MAX_TOKENS", "512")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"SGLANG_RWKV7_MARLIN_FALLBACK_MAX_TOKENS must be an integer; got {raw!r}."
+        ) from exc
+    if value < 0:
+        raise ValueError(
+            "SGLANG_RWKV7_MARLIN_FALLBACK_MAX_TOKENS must be non-negative; "
+            f"got {value}."
+        )
+    return value
+
+
+def _rwkv7_w4_shadow_mode(hidden_size: int) -> str:
+    """Choose the small-M W4 accuracy shadow.
+
+    The 2048-wide checkpoint has several near-tied greedy logits for which a
+    per-channel W8 projection can amplify chunk-boundary rounding through the
+    recurrence. Keep its exact FP16 shard by default. Wider checkpoints use
+    the compact fused INT8 shadow; callers may override either choice for an
+    explicit memory/accuracy experiment.
+    """
+    mode = os.getenv("SGLANG_RWKV7_W4_SHADOW", "auto").lower()
+    if mode == "auto":
+        return "fp16" if hidden_size <= 2048 else "int8"
+    if mode not in ("fp16", "int8"):
+        raise ValueError(
+            "SGLANG_RWKV7_W4_SHADOW must be auto, fp16, or int8; " f"got {mode!r}."
+        )
+    return mode
+
+
+def _rwkv7_int8_exact_max_tokens() -> int:
+    """Token-count limit for batch-invariant INT32 W8A8 accumulation."""
+    raw = os.getenv("SGLANG_RWKV7_INT8_EXACT_MAX_TOKENS", "512")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"SGLANG_RWKV7_INT8_EXACT_MAX_TOKENS must be an integer; got {raw!r}."
+        ) from exc
+    if value < 0:
+        raise ValueError(
+            f"SGLANG_RWKV7_INT8_EXACT_MAX_TOKENS must be non-negative; got {value}."
+        )
+    return value
+
+
+def _rwkv7_w8a8_config() -> QuantizationConfig:
+    """Lazily import W8A8 so legacy CUDA dense/BnB paths need no sgl-kernel."""
+    global _RWKV7_W8A8_CONFIG
+    if _RWKV7_W8A8_CONFIG is None:
+        from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+
+        _RWKV7_W8A8_CONFIG = W8A8Int8Config()
+    return _RWKV7_W8A8_CONFIG
+
+
+def _rwkv7_projection_quant_config(
+    quant_config: Optional[QuantizationConfig],
+    projection: str,
+    layer_id: Optional[int] = None,
+    num_hidden_layers: Optional[int] = None,
+) -> Optional[QuantizationConfig]:
+    """Apply RWKV-specific mixed-precision policy to large projections.
+
+    ``projection`` is one of ``attention``, ``ffn_key``, or ``ffn_value``.
+    The speed policies quantize every large projection. Balanced policies keep
+    recurrent attention dense. Accuracy policies additionally protect the W8
+    sqReLU expansion and the most sensitive edge FFN layers. The W4 accuracy
+    lane uses W4 only for alternating middle FFN expansion projections. The
+    contraction projection stays W8: repeated-request testing found that its
+    small-M Marlin reduction can flip near-tied greedy logits, while W4 on the
+    expansion remains deterministic and retains a real W4 memory/speed lane.
+    """
+    if quant_config is None:
+        return None
+    if projection not in ("attention", "ffn_key", "ffn_value"):
+        raise ValueError(f"Unknown RWKV-7 projection class: {projection!r}")
+
+    name = quant_config.get_name()
+    if name == "w8a8_int8":
+        policy = _rwkv7_w8_policy()
+        if policy == "speed":
+            return quant_config
+        if projection == "attention":
+            return None
+        if policy == "accuracy" and projection == "ffn_key":
+            return None
+        if policy == "accuracy" and projection == "ffn_value":
+            if layer_id is None or num_hidden_layers is None:
+                raise ValueError("FFN value policy requires layer metadata")
+            if layer_id in (0, num_hidden_layers - 1):
+                return None
+
+    if name == "marlin":
+        policy = _rwkv7_w4_policy()
+        if policy == "speed":
+            return quant_config
+        if projection == "attention":
+            return None
+        if policy == "accuracy":
+            if layer_id is None or num_hidden_layers is None:
+                raise ValueError("W4 accuracy policy requires layer metadata")
+            edge_layers = min(4, max(1, num_hidden_layers // 6))
+            if layer_id < edge_layers or layer_id >= num_hidden_layers - edge_layers:
+                return None
+            if projection == "ffn_value" or layer_id % 2:
+                return _rwkv7_w8a8_config()
+
+    return quant_config
 
 
 def _make_proj(
@@ -150,6 +297,8 @@ def _make_proj(
         m = ReplicatedLinear(
             in_f, out_f, bias=False, quant_config=quant_config, prefix=prefix
         )
+    if quant_config is not None and quant_config.get_name() == "w8a8_int8":
+        m._rwkv7_int8_exact_max_tokens = _rwkv7_int8_exact_max_tokens()
     return m
 
 
@@ -279,13 +428,54 @@ class Rwkv7Attention(nn.Module):
         self.x_a = nn.Parameter(torch.zeros(1, 1, H))
         self.x_g = nn.Parameter(torch.zeros(1, 1, H))
 
-        # Projections are quant-aware ReplicatedLinear (tp=1) / parallel linears (tp>1).
-        self.r_proj = _make_proj(H, H, quant_config, add_prefix("r_proj", prefix))
-        self.k_proj = _make_proj(H, H, quant_config, add_prefix("k_proj", prefix))
-        self.v_proj = _make_proj(H, H, quant_config, add_prefix("v_proj", prefix))
-        self.o_proj = _make_proj(
-            H, H, quant_config, add_prefix("o_proj", prefix), parallel="row"
+        # Dynamic W8A8 activation quantization inside the recurrent time-mix
+        # compounds its error through the persistent state. Keep these four
+        # attention projections in the activation dtype for the accuracy lane;
+        # the larger FFN key/value matrices still use INT8 and retain most of
+        # the memory/throughput benefit. Weight-only W4 avoids activation
+        # quantization, but its accuracy policy also keeps recurrent attention
+        # dense because these projections feed the persistent state.
+        attention_quant_config = _rwkv7_projection_quant_config(
+            quant_config,
+            "attention",
+            layer_id=layer_id,
+            num_hidden_layers=config.num_hidden_layers,
         )
+        # Projections are quant-aware ReplicatedLinear (tp=1) / parallel linears (tp>1).
+        self.r_proj = _make_proj(
+            H, H, attention_quant_config, add_prefix("r_proj", prefix)
+        )
+        self.k_proj = _make_proj(
+            H, H, attention_quant_config, add_prefix("k_proj", prefix)
+        )
+        self.v_proj = _make_proj(
+            H, H, attention_quant_config, add_prefix("v_proj", prefix)
+        )
+        self.o_proj = _make_proj(
+            H,
+            H,
+            attention_quant_config,
+            add_prefix("o_proj", prefix),
+            parallel="row",
+        )
+        # The 1.5B decode shape is launch-bound: one strided-batched GEMM is
+        # measurably faster than three independent R/K/V GEMMs at B=1/2/4/8.
+        # Re-home the three canonical parameters as views into one storage so
+        # the fast path needs neither a per-forward stack nor a duplicate
+        # weight copy.  Checkpoint names and per-parameter weight loaders stay
+        # unchanged; in-place RL/weight updates update the shared storage too.
+        self._rkv_stacked_weight = None
+        self._rkv_pack_enabled = (
+            H == 2048
+            and _tp_size() == 1
+            and attention_quant_config is None
+            and all(
+                getattr(module, "weight", None) is not None and module.weight.ndim == 2
+                for module in (self.r_proj, self.k_proj, self.v_proj)
+            )
+        )
+        if self._rkv_pack_enabled:
+            self._pack_rkv_weights()
 
         low_rank_quant_config = quant_config
         if quant_config is not None and quant_config.get_name() in (
@@ -340,8 +530,42 @@ class Rwkv7Attention(nn.Module):
         )
 
         # Stacked token-shift mix vectors, lazily built (post weight-load)
-        # on first forward and cached. Order [x_r, x_k, x_w, x_a, x_g, x_v].
+        # on first forward and cached. R/K/V occupy the first three contiguous
+        # slices so the small-batch strided-batched projection consumes a view.
+        # Order [x_r, x_k, x_v, x_w, x_a, x_g].
         self._mix6 = None
+
+    def _pack_rkv_weights(self) -> None:
+        """Re-home canonical R/K/V parameters as views of one 3-D storage."""
+        modules = (self.r_proj, self.k_proj, self.v_proj)
+        original = [module.weight for module in modules]
+        base = torch.empty(
+            (3, *original[0].shape),
+            dtype=original[0].dtype,
+            device=original[0].device,
+        )
+        with torch.no_grad():
+            for old_weight, new_storage in zip(original, base):
+                new_storage.copy_(old_weight)
+        for module, old_weight, new_storage in zip(modules, original, base):
+            new_weight = nn.Parameter(
+                new_storage, requires_grad=old_weight.requires_grad
+            )
+            # Preserve SGLang's per-parameter weight-loader metadata.
+            new_weight.__dict__.update(old_weight.__dict__)
+            module.weight = new_weight
+        # A plain tensor attribute (not a parameter/buffer) owns the common
+        # 3-D view without adding a duplicate state-dict/load obligation.
+        self._rkv_stacked_weight = base
+
+    def _apply(self, fn, recurse=True):
+        # ``Module.to`` transforms registered parameters independently. Repack
+        # afterward so R/K/V retain shared storage instead of silently keeping
+        # an obsolete duplicate base and falling off the optimized path.
+        result = super()._apply(fn, recurse=recurse)
+        if self._rkv_pack_enabled:
+            self._pack_rkv_weights()
+        return result
 
     def _mix6_buf(self) -> torch.Tensor:
         if self._mix6 is None:
@@ -349,10 +573,10 @@ class Rwkv7Attention(nn.Module):
                 [
                     self.x_r.reshape(-1),
                     self.x_k.reshape(-1),
+                    self.x_v.reshape(-1),
                     self.x_w.reshape(-1),
                     self.x_a.reshape(-1),
                     self.x_g.reshape(-1),
-                    self.x_v.reshape(-1),
                 ],
                 dim=0,
             ).contiguous()
@@ -363,6 +587,7 @@ class Rwkv7Attention(nn.Module):
         forward_batch: ForwardBatch,
         x: torch.Tensor,
         v_first: Optional[torch.Tensor],
+        norm: Optional[nn.LayerNorm] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         T = x.shape[0]
         if T == 0:
@@ -372,16 +597,26 @@ class Rwkv7Attention(nn.Module):
         # Local (per-rank) head slice; == the full width at tp=1.
         H, hd, nh = self.local_hidden_size, self.head_dim, self.local_num_heads
 
-        # Fused triton elementwise path: bit-identical to the torch reference at
-        # bf16/fp16 (verified), so it stacks with cuda-graph + int8. fp32 keeps the
-        # original torch path (1-ULP reduction-order drift would risk the fp32 gate).
+        # Fused Triton serving path: the elementwise pieces are bit-identical at
+        # bf16/fp16; fused GroupNorm has a bounded reduction-order delta covered
+        # by end-to-end logit/greedy gates. fp32 keeps the strict torch path.
         fused = x.dtype != torch.float32
 
         if fused:
-            shifted = be.token_shift(x, self.layer_id, 0, forward_batch)
-            lp = fused_lerp6(x, shifted, self._mix6_buf())
-            xr, xk, xw, xa, xg, xv = lp[0], lp[1], lp[2], lp[3], lp[4], lp[5]
+            lp = be.token_shift_lerp6(
+                x,
+                self._mix6_buf(),
+                self.layer_id,
+                0,
+                forward_batch,
+                norm_weight=None if norm is None else norm.weight,
+                norm_bias=None if norm is None else norm.bias,
+                norm_eps=1e-5 if norm is None else norm.eps,
+            )
+            xr, xk, xv, xw, xa, xg = lp[0], lp[1], lp[2], lp[3], lp[4], lp[5]
         else:
+            if norm is not None:
+                x = norm(x)
             shifted = be.token_shift(x, self.layer_id, 0, forward_batch)
             d = shifted - x
             xr = x + self.x_r.view(-1) * d
@@ -391,19 +626,56 @@ class Rwkv7Attention(nn.Module):
             xa = x + self.x_a.view(-1) * d
             xg = x + self.x_g.view(-1) * d
 
-        r = self.r_proj(xr)[0]
-        k = self.k_proj(xk)[0]
-        v = self.v_proj(xv)[0]
+        stacked = self._rkv_stacked_weight
+        if (
+            stacked is not None
+            and fused
+            and (T in (1, 2, 4, 8) or T >= 256)
+            and stacked.device == xr.device
+            and stacked.dtype == xr.dtype
+            and self.r_proj.weight.data_ptr() == stacked[0].data_ptr()
+            and self.k_proj.weight.data_ptr() == stacked[1].data_ptr()
+            and self.v_proj.weight.data_ptr() == stacked[2].data_ptr()
+        ):
+            rkv = torch.bmm(lp[:3], stacked.transpose(1, 2))
+            r, k, v = rkv[0], rkv[1], rkv[2]
+        else:
+            r = self.r_proj(xr)[0]
+            k = self.k_proj(xk)[0]
+            v = self.v_proj(xv)[0]
 
         if self.layer_id == 0:
             v_first = v
 
-        # LoRA gates: w=decay, a=in-context-lr, g=output-gate, v=v-residual (layer>0).
-        w_log = -torch.sigmoid(self.w_lora(xw)) * _INV_SQRT_E
-        a = torch.sigmoid(self.a_lora(xa))
-        g = self.g_lora(xg)
-        if self.layer_id != 0:
-            v = v + (v_first - v) * torch.sigmoid(self.v_lora(xv))
+        # LoRA gates: w=decay, a=in-context-lr, g=output-gate, v=v-residual
+        # (layer>0). Decode batches <=8 use two grouped Triton launches while
+        # retaining separately named canonical weights and the generic path.
+        v_lora = self.v_lora if self.layer_id != 0 else None
+        use_fused_lowrank = (
+            fused
+            and is_profitable_fused_lowrank_shape(H, T)
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and can_fuse_lowrank_controls(self.w_lora, self.a_lora, self.g_lora, v_lora)
+        )
+        if use_fused_lowrank:
+            w_log, a, g, v = fused_lowrank_controls(
+                xw,
+                xa,
+                xg,
+                xv,
+                v,
+                v_first,
+                self.w_lora,
+                self.a_lora,
+                self.g_lora,
+                v_lora,
+            )
+        else:
+            w_log = -torch.sigmoid(self.w_lora(xw)) * _INV_SQRT_E
+            a = torch.sigmoid(self.a_lora(xa))
+            g = self.g_lora(xg)
+            if self.layer_id != 0:
+                v = v + (v_first - v) * torch.sigmoid(self.v_lora(xv))
 
         if fused:
             # kk = L2norm(k·k_k) over hd; k <- k + k·(a-1)·k_a  (one launch)
@@ -426,11 +698,22 @@ class Rwkv7Attention(nn.Module):
 
         o = be.recurrence(r, w_log, k, v, kk, a, self.layer_id, forward_batch)
         # o: [T, nh, hd]
-        o = self.g_norm(o.reshape(T, H))
         if fused:
-            # o = (g_norm(o) + (r*k*r_k).sum(-1)*v) * g   (one launch)
-            o = fused_gate_corr(o, r, k, self.r_k, v, g, nh)
+            # GroupNorm + recurrent correction + output gate (one launch).
+            o = fused_groupnorm_gate_corr(
+                o,
+                r,
+                k,
+                self.r_k,
+                v,
+                g,
+                self.g_norm.weight,
+                self.g_norm.bias,
+                nh,
+                self.g_norm.eps,
+            )
         else:
+            o = self.g_norm(o.reshape(T, H))
             gate_corr = ((r * k * self.r_k).sum(dim=-1, keepdim=True) * v).reshape(T, H)
             o = o + gate_corr
             o = o * g
@@ -454,21 +737,100 @@ class Rwkv7FeedForward(nn.Module):
         self.hidden_size = H
         inter = config.intermediate_size
         self.x_k = nn.Parameter(torch.zeros(H))
+        self.activation = ReLU2()
+        # W8A8 on the expansion projection perturbs values before sqReLU,
+        # which squares that activation error. Keep ``key`` dense and quantize
+        # the equally large contraction projection (``value``); this is the
+        # conservative W8 accuracy lane. W4 accuracy protects edge layers and
+        # interleaves W4/W8 FFN blocks in the middle of the stack.
+        key_quant_config = _rwkv7_projection_quant_config(
+            quant_config,
+            "ffn_key",
+            layer_id=layer_id,
+            num_hidden_layers=config.num_hidden_layers,
+        )
         # tp>1: key is column-parallel (local inter slice; sqrelu is elementwise so
         # it acts per-slice), value is row-parallel (allreduce restores the full H).
-        self.key = _make_proj(H, inter, quant_config, add_prefix("key", prefix))
+        self.key = _make_proj(H, inter, key_quant_config, add_prefix("key", prefix))
+        if (
+            key_quant_config is not None
+            and key_quant_config.get_name() == "marlin"
+            and _rwkv7_w4_policy() == "accuracy"
+        ):
+            # Marlin remains the throughput path for large prefills. The
+            # checkpoint-sensitive small-M shadow is exact FP16 at width 2048
+            # and compact fused INT8 on wider models (overridable by env).
+            local_inter = self.key.s.shape[1]
+            if _rwkv7_w4_shadow_mode(H) == "fp16":
+                self.key.register_buffer(
+                    "_rwkv7_decode_weight",
+                    torch.empty(
+                        local_inter,
+                        H,
+                        dtype=self.key.s.dtype,
+                        device=self.key.s.device,
+                    ),
+                    persistent=False,
+                )
+            else:
+                self.key.register_buffer(
+                    "_rwkv7_decode_qweight",
+                    torch.empty(
+                        local_inter,
+                        H,
+                        dtype=torch.int8,
+                        device=self.key.s.device,
+                    ),
+                    persistent=False,
+                )
+                self.key.register_buffer(
+                    "_rwkv7_decode_scales",
+                    torch.empty(
+                        local_inter,
+                        1,
+                        dtype=torch.float32,
+                        device=self.key.s.device,
+                    ),
+                    persistent=False,
+                )
+            self.key._rwkv7_marlin_fallback_max_tokens = (
+                _rwkv7_marlin_fallback_max_tokens()
+            )
+        value_quant_config = _rwkv7_projection_quant_config(
+            quant_config,
+            "ffn_value",
+            layer_id=layer_id,
+            num_hidden_layers=config.num_hidden_layers,
+        )
         self.value = _make_proj(
-            inter, H, quant_config, add_prefix("value", prefix), parallel="row"
+            inter,
+            H,
+            value_quant_config,
+            add_prefix("value", prefix),
+            parallel="row",
         )
 
-    def forward(self, forward_batch: ForwardBatch, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        forward_batch: ForwardBatch,
+        x: torch.Tensor,
+        norm: Optional[nn.LayerNorm] = None,
+    ) -> torch.Tensor:
         if x.shape[0] == 0:
             return x
         be = _linear_backend(forward_batch)
-        shifted = be.token_shift(x, self.layer_id, 1, forward_batch)
-        xk = x + self.x_k * (shifted - x)
+        xk = be.token_shift_lerp1(
+            x,
+            self.x_k,
+            self.layer_id,
+            1,
+            forward_batch,
+            norm_weight=None if norm is None else norm.weight,
+            norm_bias=None if norm is None else norm.bias,
+            norm_eps=1e-5 if norm is None else norm.eps,
+        )
         k = self.key(xk)[0]
-        act = torch.relu(k) ** 2
+        act = self.activation(k)
         out = self.value(act)[0]
         return out
 
@@ -510,9 +872,9 @@ class Rwkv7DecoderLayer(nn.Module):
         x: torch.Tensor,
         v_first: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        attn_out, v_first = self.attn(forward_batch, self.attn_norm(x), v_first)
+        attn_out, v_first = self.attn(forward_batch, x, v_first, norm=self.attn_norm)
         x = x + attn_out
-        x = x + self.ffn(forward_batch, self.ffn_norm(x))
+        x = x + self.ffn(forward_batch, x, norm=self.ffn_norm)
         return x, v_first
 
 
@@ -657,12 +1019,24 @@ class Rwkv7ForCausalLM(nn.Module):
         self.model = Rwkv7Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
+        # Keep the vocabulary projection in the activation dtype for online
+        # weight conversion. Its logits are especially sensitive to coarse
+        # per-channel quantization, while retaining it costs little relative
+        # to the six large projections in every RWKV block. This also matches
+        # the usual AWQ/GPTQ policy of leaving lm_head unquantized.
+        lm_head_quant_config = quant_config
+        if quant_config is not None and quant_config.get_name() in (
+            "bitsandbytes",
+            "marlin",
+            "w8a8_int8",
+        ):
+            lm_head_quant_config = None
         # lm_head exists on every pp rank (llama pattern; only the last rank uses
         # it — the logits_processor runs there).
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
-            quant_config=quant_config,
+            quant_config=lm_head_quant_config,
             org_num_embeddings=config.vocab_size,
             prefix=add_prefix("lm_head", prefix),
         )
@@ -732,10 +1106,60 @@ class Rwkv7ForCausalLM(nn.Module):
                     raise RuntimeError(
                         "Online Marlin quantization requires NVIDIA SM80 or newer."
                     )
-                packed_weight, weight_scale = _online_marlin_quantize_weight(
-                    loaded_weight,
-                    group_size=self.quant_config.group_size,
-                )
+                shadow_name = marlin_prefix + "._rwkv7_decode_qweight"
+                shadow_scale_name = marlin_prefix + "._rwkv7_decode_scales"
+                dense_shadow_name = marlin_prefix + "._rwkv7_decode_weight"
+                if dense_shadow_name in params_dict:
+                    packed_weight, weight_scale = _online_marlin_quantize_weight(
+                        loaded_weight,
+                        group_size=self.quant_config.group_size,
+                    )
+                    dense_shadow = params_dict[dense_shadow_name]
+                    fallback_weight = loaded_weight
+                    if fallback_weight.shape != dense_shadow.shape:
+                        shard = dense_shadow.shape[0]
+                        fallback_weight = fallback_weight.narrow(
+                            0, tp_rank * shard, shard
+                        )
+                    dense_shadow.copy_(
+                        fallback_weight.to(
+                            device=dense_shadow.device, dtype=dense_shadow.dtype
+                        )
+                    )
+                    loaded_params.add(dense_shadow_name)
+                elif shadow_name in params_dict:
+                    if _online_marlin_quantize_weight_with_int8_shadow is None:
+                        raise RuntimeError(
+                            "RWKV-7 online W4 shadow requires NVIDIA SM80 or newer."
+                        )
+                    (
+                        packed_weight,
+                        weight_scale,
+                        shadow_weight,
+                        shadow_scales,
+                    ) = _online_marlin_quantize_weight_with_int8_shadow(
+                        loaded_weight,
+                        group_size=self.quant_config.group_size,
+                    )
+                    shadow = params_dict[shadow_name]
+                    fallback_scales = params_dict[shadow_scale_name]
+                    if shadow_weight.shape != shadow.shape:
+                        shard = shadow.shape[0]
+                        shadow_weight = shadow_weight.narrow(0, tp_rank * shard, shard)
+                        shadow_scales = shadow_scales.narrow(0, tp_rank * shard, shard)
+                    shadow.copy_(shadow_weight.to(device=shadow.device))
+                    fallback_scales.copy_(
+                        shadow_scales.to(
+                            device=fallback_scales.device,
+                            dtype=fallback_scales.dtype,
+                        )
+                    )
+                    loaded_params.update((shadow_name, shadow_scale_name))
+                else:
+                    packed_weight, weight_scale = _online_marlin_quantize_weight(
+                        loaded_weight,
+                        group_size=self.quant_config.group_size,
+                    )
                 for target_name, tensor in (
                     (marlin_weight_name, packed_weight),
                     (marlin_scale_name, weight_scale),

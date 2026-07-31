@@ -207,7 +207,11 @@ def _matmul_persistent_triton(
         },
         torch.float16: {
             "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 256,
+            # A 256-wide tile requires 106,496 bytes of shared memory in
+            # Triton, exceeding the 101,376-byte opt-in limit on Ada (SM89).
+            # The 128-wide tile keeps deterministic inference portable across
+            # Ampere/Ada while preserving the same reduction order.
+            "BLOCK_SIZE_N": 128,
             "BLOCK_SIZE_K": 64,
             "GROUP_SIZE_M": 8,
             "num_stages": 3,

@@ -22,16 +22,26 @@ is still driven through HybridLinearAttnBackend, so `self.forward_metadata`
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
+from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 
 # The WKV recurrence is a self-contained triton kernel for BOTH the decode
 # (T==1) AND the extend/prefill (packed varlen via cu_seqlens) path, with no
 # dependency on the flash-linear-attention package.
-from sglang.srt.layers.attention.rwkv7_kernels import wkv_recurrent
+from sglang.srt.layers.attention.rwkv7_kernels import (
+    layernorm_token_shift_lerp1_decode,
+    layernorm_token_shift_lerp6_decode,
+    token_shift_lerp6_decode,
+    token_shift_lerp6_packed_varlen,
+    token_shift_packed_varlen,
+    wkv_recurrent,
+)
+from sglang.srt.layers.attention.rwkv7_kernels.fused import fused_lerp6
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -93,6 +103,11 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
     """
 
     supports_draft_extend_v2 = True
+    # DRAFT_EXTEND_V2 has a fixed request width for the topk=1 RWKV chain and
+    # all recurrent metadata is refreshed through graph-stable buffers. Opt in
+    # explicitly so the speculative worker captures this otherwise launch-bound
+    # pass instead of replaying hundreds of eager kernels per verify cycle.
+    supports_speculative_draft_extend_cuda_graph = True
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
@@ -115,6 +130,143 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
         # Set by Rwkv7MultiStepDraftBackend for the topk=1 candidate chain.
         # Normal target/draft-extend backends leave this as None.
         self.draft_step_index: Optional[int] = None
+        # Full prefill CUDA graphs use a fixed request-slot count and refresh
+        # these buffers in place before replay. Every token bucket captures the
+        # same addresses, so one max-bs allocation is sufficient for all graphs.
+        self.prefill_query_start_loc: Optional[torch.Tensor] = None
+        self.prefill_state_indices: Optional[torch.Tensor] = None
+        self.draft_extend_query_start_loc: Optional[torch.Tensor] = None
+        self.draft_extend_state_indices: Optional[torch.Tensor] = None
+        self.draft_extend_width: Optional[int] = None
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        super().init_cuda_graph_state(max_bs, max_num_tokens)
+        self._ensure_prefill_cuda_graph_state(max_bs)
+
+    def _ensure_prefill_cuda_graph_state(self, min_bs: int):
+        """Allocate once: prefill capture runs before decode graph setup.
+
+        Decode graph initialization must not replace these tensors after full
+        prefill graphs have captured their addresses. Allocate up to the request
+        pool capacity on first use and preserve the allocation thereafter.
+        """
+        if self.prefill_state_indices is not None:
+            if min_bs > self.prefill_state_indices.numel():
+                raise RuntimeError(
+                    "RWKV-7 prefill CUDA-graph request capacity cannot grow after "
+                    f"capture: requested {min_bs}, allocated "
+                    f"{self.prefill_state_indices.numel()}."
+                )
+            return
+        capacity = max(min_bs, self.req_to_token_pool.size)
+        self.prefill_query_start_loc = torch.zeros(
+            (capacity + 1,), dtype=torch.int32, device=self.device
+        )
+        self.prefill_state_indices = torch.full(
+            (capacity,), self.pad_slot_id, dtype=torch.int32, device=self.device
+        )
+
+    def _ensure_draft_extend_cuda_graph_state(self, min_bs: int, width: int):
+        if self.draft_extend_state_indices is not None:
+            if min_bs > self.draft_extend_state_indices.numel():
+                raise RuntimeError(
+                    "RWKV-7 draft-extend CUDA-graph request capacity cannot grow "
+                    f"after capture: requested {min_bs}, allocated "
+                    f"{self.draft_extend_state_indices.numel()}."
+                )
+            if width != self.draft_extend_width:
+                raise RuntimeError(
+                    "RWKV-7 draft-extend CUDA-graph width changed after capture: "
+                    f"requested {width}, captured {self.draft_extend_width}."
+                )
+            return
+
+        capacity = max(min_bs, self.req_to_token_pool.size)
+        self.draft_extend_width = width
+        self.draft_extend_query_start_loc = torch.arange(
+            0,
+            (capacity + 1) * width,
+            step=width,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.draft_extend_state_indices = torch.full(
+            (capacity,), self.pad_slot_id, dtype=torch.int32, device=self.device
+        )
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        """Refresh graph-stable RWKV metadata for decode or full prefill.
+
+        The shared Mamba implementation's CUDA-graph metadata planner is
+        decode/verify-only and indexes its buffers by token batch size. Full
+        prefill graphs instead carry a fixed number of request slots and packed
+        token offsets, including zero-length sentinel slots. Handle that case
+        explicitly while retaining the shared implementation for decode and
+        speculative verify.
+        """
+        if forward_batch.forward_mode.is_draft_extend_v2():
+            bs = forward_batch.batch_size
+            width = forward_batch.spec_info.num_tokens_per_req
+            self._ensure_draft_extend_cuda_graph_state(bs, width)
+            state_indices = self.draft_extend_state_indices[:bs]
+            state_indices.copy_(
+                self._translate_mamba_indices(
+                    self.req_to_token_pool.get_mamba_indices(
+                        forward_batch.req_pool_indices[:bs]
+                    )
+                )
+            )
+            self.forward_metadata = ForwardMetadata(
+                query_start_loc=self.draft_extend_query_start_loc[: bs + 1],
+                mamba_cache_indices=state_indices,
+            )
+            return
+
+        if not (
+            forward_batch.forward_mode.is_extend(include_draft_extend_v2=False)
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
+            return super().init_forward_metadata_out_graph(
+                forward_batch, in_capture=in_capture
+            )
+
+        bs = forward_batch.batch_size
+        if (
+            self.prefill_query_start_loc is None
+            or self.prefill_state_indices is None
+            or bs > self.prefill_state_indices.numel()
+        ):
+            self._ensure_prefill_cuda_graph_state(bs)
+
+        query_start_loc = self.prefill_query_start_loc[: bs + 1]
+        query_start_loc[:bs].copy_(forward_batch.extend_start_loc[:bs])
+        query_start_loc[bs].copy_(
+            forward_batch.extend_start_loc[bs - 1]
+            + forward_batch.extend_seq_lens[bs - 1]
+        )
+
+        mamba_indices = self.req_to_token_pool.get_mamba_indices(
+            forward_batch.req_pool_indices[:bs]
+        )
+        mamba_indices = self._translate_mamba_indices(mamba_indices)
+        # Full-prefill capture/replay pads unused request slots with zero-length
+        # sentinels. Mark them as invalid so state reads/writes are strict no-ops.
+        live = forward_batch.extend_seq_lens[:bs] > 0
+        mamba_indices = torch.where(
+            live,
+            mamba_indices,
+            torch.full_like(mamba_indices, self.pad_slot_id),
+        )
+        state_indices = self.prefill_state_indices[:bs]
+        state_indices.copy_(mamba_indices)
+        self.forward_metadata = ForwardMetadata(
+            query_start_loc=query_start_loc,
+            mamba_cache_indices=state_indices,
+        )
 
     # ---- token-shift (width-2 causal shift via the conv state) ----
     def token_shift(
@@ -216,25 +368,123 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
             conv[safe_idx, :, 0] = x.to(conv.dtype)
             return prev.to(x.dtype)
 
-        # extend (packed B=1, varlen via query_start_loc)
-        qsl = md.query_start_loc.to(torch.long)
-        starts = qsl[:-1]
-        ends = qsl[1:]
-        shifted = torch.empty_like(x)
-        if x.shape[0] > 1:
-            shifted[1:] = x[:-1]
-        # Same pad convention as the decode path: route PAD_SLOT_ID = -1 to the
-        # pool's reserved row 0. Fresh sequences' slots are zeroed upstream on
-        # the forward stream (`mamba_needs_clear` is set at slot alloc,
-        # collected in prepare_for_extend, and cleared by the ModelRunner
-        # before any layer reads the pool), so this backend only handles pads.
-        safe_idx = torch.clamp_min(cache_indices, 0)
-        # first token of each sequence reads the stored prev-token (0 for fresh
-        # reqs; the correct carry-in for chunked prefill / prefix continuation).
-        shifted[starts] = conv[safe_idx, :, 0].to(x.dtype)
-        # store last token of each sequence for the next chunk / decode.
-        conv[safe_idx, :, 0] = x[ends - 1].to(conv.dtype)
-        return shifted
+        # extend (packed B=1, varlen via query_start_loc). The Triton boundary
+        # update masks full-CUDA-graph zero-length sentinel slots instead of
+        # forming one-past-the-end torch advanced indices.
+        return token_shift_packed_varlen(
+            x,
+            conv,
+            md.query_start_loc,
+            cache_indices,
+        )
+
+    def token_shift_lerp6(
+        self,
+        x: torch.Tensor,
+        mix6: torch.Tensor,
+        layer_id: int,
+        conv_idx: int,
+        forward_batch: ForwardBatch,
+        norm_weight: Optional[torch.Tensor] = None,
+        norm_bias: Optional[torch.Tensor] = None,
+        norm_eps: float = 1e-5,
+    ) -> torch.Tensor:
+        """Fuse normal serving token shift/state update with six time mixes.
+
+        Speculative modes retain ``token_shift`` because their state protocol
+        writes acceptance-window scratch rather than the persistent state pool.
+        """
+        mode = forward_batch.forward_mode
+        has_norm = norm_weight is not None
+        if (
+            has_norm
+            and x.dtype in (torch.float16, torch.bfloat16)
+            and not self.is_draft_worker
+            and not mode.is_draft_extend_v2()
+            and not mode.is_target_verify()
+            and mode.is_decode_or_idle()
+        ):
+            cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+            return layernorm_token_shift_lerp6_decode(
+                x,
+                cache.conv[conv_idx],
+                mix6,
+                norm_weight,
+                norm_bias,
+                norm_eps,
+                self.forward_metadata.mamba_cache_indices,
+            )
+        if has_norm:
+            x = F.layer_norm(
+                x,
+                (x.shape[-1],),
+                norm_weight,
+                norm_bias,
+                norm_eps,
+            )
+        if self.is_draft_worker or mode.is_draft_extend_v2() or mode.is_target_verify():
+            return fused_lerp6(
+                x,
+                self.token_shift(x, layer_id, conv_idx, forward_batch),
+                mix6,
+            )
+
+        cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        conv = cache.conv[conv_idx]
+        md = self.forward_metadata
+        cache_indices = md.mamba_cache_indices
+        if mode.is_decode_or_idle():
+            return token_shift_lerp6_decode(x, conv, mix6, cache_indices)
+        return token_shift_lerp6_packed_varlen(
+            x,
+            conv,
+            mix6,
+            md.query_start_loc,
+            cache_indices,
+        )
+
+    def token_shift_lerp1(
+        self,
+        x: torch.Tensor,
+        mix: torch.Tensor,
+        layer_id: int,
+        conv_idx: int,
+        forward_batch: ForwardBatch,
+        norm_weight: Optional[torch.Tensor] = None,
+        norm_bias: Optional[torch.Tensor] = None,
+        norm_eps: float = 1e-5,
+    ) -> torch.Tensor:
+        """Fuse the FFN decode LayerNorm, token shift and one time mix."""
+        mode = forward_batch.forward_mode
+        has_norm = norm_weight is not None
+        if (
+            has_norm
+            and x.dtype in (torch.float16, torch.bfloat16)
+            and not self.is_draft_worker
+            and not mode.is_draft_extend_v2()
+            and not mode.is_target_verify()
+            and mode.is_decode_or_idle()
+        ):
+            cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+            return layernorm_token_shift_lerp1_decode(
+                x,
+                cache.conv[conv_idx],
+                mix,
+                norm_weight,
+                norm_bias,
+                norm_eps,
+                self.forward_metadata.mamba_cache_indices,
+            )
+        if has_norm:
+            x = F.layer_norm(
+                x,
+                (x.shape[-1],),
+                norm_weight,
+                norm_bias,
+                norm_eps,
+            )
+        shifted = self.token_shift(x, layer_id, conv_idx, forward_batch)
+        return x + mix * (shifted - x)
 
     # ---- WKV recurrence (decode + extend both -> the wkv_recurrent kernel) ----
     def recurrence(
@@ -390,12 +640,11 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
             )
             return o.squeeze(1)  # [bs, H, V]
 
-        # extend: packed B=1, varlen -> the same recurrent triton kernel.
-        # Same pad convention as token_shift (fresh-slot zeroing likewise
-        # happens upstream before the layers run).
-        safe_idx = torch.clamp_min(cache_indices, 0)
-        init_state = temporal[safe_idx].contiguous().float()  # [N, H, K, V]
-        cu = md.query_start_loc.to(torch.int64)
+        # extend: packed B=1, varlen -> in-place indexed recurrent kernel. This
+        # removes a full [N,H,K,V] gather, temporary final-state allocation and
+        # scatter per layer. Negative cache indices from graph padding are masked
+        # inside the kernel and therefore do not touch the state pool.
+        cu = md.query_start_loc
         r1 = r.unsqueeze(0).contiguous()
         w1 = w.unsqueeze(0).contiguous()
         k1 = k.unsqueeze(0).contiguous()
@@ -410,11 +659,11 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
             kk1,
             a1,
             scale=self.scale,
-            initial_state=init_state,
-            output_final_state=True,
             cu_seqlens=cu,
+            state_pool=temporal,
+            cache_indices=cache_indices,
         )
-        temporal[safe_idx] = final_state.to(temporal.dtype)
+        assert final_state is None
         return o.squeeze(0)  # [total_T, H, V]
 
     # The model calls token_shift/recurrence directly; these are not used.

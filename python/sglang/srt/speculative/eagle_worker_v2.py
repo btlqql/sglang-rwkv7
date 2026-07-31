@@ -454,15 +454,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.draft_attn_backend, AiterMultiStepDraftBackend
             )
 
-        if self.draft_extend_attn_backend is None or (
-            getattr(
-                self.draft_extend_attn_backend,
+        declared_graph_support = getattr(
+            self.draft_extend_attn_backend,
+            "supports_speculative_draft_extend_cuda_graph",
+            None,
+        )
+        if declared_graph_support is None:
+            declared_graph_support = getattr(
+                getattr(self.draft_extend_attn_backend, "linear_attn_backend", None),
                 "supports_speculative_draft_extend_cuda_graph",
                 None,
             )
-            is False
-        ):
+        if self.draft_extend_attn_backend is None or declared_graph_support is False:
             graph_supported_backend = False
+        elif declared_graph_support is True:
+            graph_supported_backend = True
         else:
             # These backends are needed only for draft-extend graph capability
             # detection. Keep them lazy so eager recurrent paths do not require

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from sglang.srt.configs.model_config import (
     get_hybrid_layer_ids,
     is_embedding_gemma,
+    is_position_unbounded_recurrent_config,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -50,6 +51,22 @@ class TestEmbeddingGemmaConfig(CustomTestCase):
             model_type="gemma3_text", use_bidirectional_attention=False
         )
         self.assertFalse(is_embedding_gemma(config))
+
+
+class TestPositionUnboundedRecurrentConfig(CustomTestCase):
+    def test_rwkv7_converter_model_types_are_position_unbounded(self):
+        for model_type in ("rwkv7", "rwkv7_native", "rwkv7_hf_adapter"):
+            with self.subTest(model_type=model_type):
+                self.assertTrue(
+                    is_position_unbounded_recurrent_config(
+                        SimpleNamespace(model_type=model_type)
+                    )
+                )
+
+    def test_positional_model_is_not_position_unbounded(self):
+        self.assertFalse(
+            is_position_unbounded_recurrent_config(SimpleNamespace(model_type="qwen3"))
+        )
 
 
 if __name__ == "__main__":

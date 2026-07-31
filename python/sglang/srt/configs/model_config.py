@@ -102,6 +102,23 @@ def _hf_attr(config, name):
     return getattr(config, name, None)
 
 
+def is_position_unbounded_recurrent_config(config) -> bool:
+    """Return whether ``max_position_embeddings`` is not a model limit.
+
+    RWKV-7 carries recurrent state instead of indexing a positional table or a
+    RoPE cache. Some converted checkpoints still retain the converter's
+    ``max_position_embeddings`` value, but it is metadata rather than an
+    architectural context bound. This matters for STANDALONE speculation: a
+    small draft must inherit the target's context length without requiring the
+    global unsafe-override switch used by positional models.
+    """
+    return _hf_attr(config, "model_type") in {
+        "rwkv7",
+        "rwkv7_native",
+        "rwkv7_hf_adapter",
+    }
+
+
 def is_deepseek_dsa(config) -> bool:
     return (
         _hf_arch(config)
@@ -742,7 +759,8 @@ class ModelConfig:
                     f"This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config."
                 )
                 if (
-                    envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.get()
+                    is_position_unbounded_recurrent_config(self.hf_text_config)
+                    or envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.get()
                     or is_in_ci()  # FIXME: fix this special case
                 ):
                     logger.warning(msg)

@@ -29,7 +29,8 @@ step becomes (k indexes K, v indexes V):
     o[v]     = sum_k S[k, v] * (scale * r[k])    # = (S_np @ (scale*r))[v]
 
 Both reductions contract only the K axis, so tiling the V axis (BV) is exact
-and embarrassingly parallel. State accumulation is fp32 throughout.
+and embarrassingly parallel. The default state/accumulation contract is FP32;
+an explicitly FP16 state pool selects the lower-precision performance lane.
 
 Conventions match the (now-retired) FLA `fused_mul_recurrent_rwkv7` so the
 backend call sites are unchanged:
@@ -37,12 +38,20 @@ backend call sites are unchanged:
   * `w` is log-decay; the kernel applies exp(w)
   * `kk` is L2-normalized by the caller; `a_kernel=-kk`, `b_kernel=kk*a` formed here
   * `scale` is applied to r
-  * state [N, H, K, V] fp32; returns (o[B, T, H, V], final_state[N, H, K, V] or None)
+  * state [N, H, K, V] in the configured state dtype; returns
+    (o[B, T, H, V], final_state[N, H, K, V] or None)
 """
+
+import os
 
 import torch
 import triton
 import triton.language as tl
+
+from sglang.srt.layers.attention.rwkv7_kernels.wkv_cuda import (
+    can_use_wkv_varlen_fp16_cuda,
+    wkv_varlen_fp16_cuda,
+)
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -75,6 +84,7 @@ def _wkv_recurrent_kernel(
     INTERMEDIATE_STEPS: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     INDEXED_STATE: tl.constexpr,
+    FP16_COMPUTE: tl.constexpr,
 ):
     # program grid: (V-tile, request*head). One program owns the full K axis and
     # a BV-slice of V for a single (request, head); it walks the sequence in time.
@@ -115,10 +125,12 @@ def _wkv_recurrent_kernel(
         s_mask = mask_s
 
     # S[K, V] fp32 == numpy oracle state transposed.
-    S = tl.zeros([BK, BV], dtype=tl.float32)
+    S = tl.zeros([BK, BV], dtype=tl.float16 if FP16_COMPUTE else tl.float32)
     if USE_INITIAL_STATE:
         p_h0 = h0_ptr + state_nh * K * V + o_k[:, None] * V + o_v[None, :]
-        S += tl.load(p_h0, mask=s_mask, other=0.0).to(tl.float32)
+        S += tl.load(p_h0, mask=s_mask, other=0.0).to(
+            tl.float16 if FP16_COMPUTE else tl.float32
+        )
 
     # token-0 pointers into the packed [., T, H, .] layout (B folded into bos).
     base_k = bos * H * K + i_h * K
@@ -133,25 +145,29 @@ def _wkv_recurrent_kernel(
 
     i_t = 0
     for _ in range(0, seqlen):
-        b_r = tl.load(p_r, mask=mask_k, other=0.0).to(tl.float32) * scale
-        b_w = tl.load(p_w, mask=mask_k, other=0.0).to(tl.float32)
-        b_k = tl.load(p_k, mask=mask_k, other=0.0).to(tl.float32)
-        b_a = tl.load(p_a, mask=mask_k, other=0.0).to(tl.float32)
-        b_kk = tl.load(p_kk, mask=mask_k, other=0.0).to(tl.float32)
-        b_v = tl.load(p_v, mask=mask_v, other=0.0).to(tl.float32)
+        compute_dtype = tl.float16 if FP16_COMPUTE else tl.float32
+        b_r = tl.load(p_r, mask=mask_k, other=0.0).to(compute_dtype) * scale
+        b_w = tl.load(p_w, mask=mask_k, other=0.0).to(compute_dtype)
+        b_k = tl.load(p_k, mask=mask_k, other=0.0).to(compute_dtype)
+        b_a = tl.load(p_a, mask=mask_k, other=0.0).to(compute_dtype)
+        b_kk = tl.load(p_kk, mask=mask_k, other=0.0).to(compute_dtype)
+        b_v = tl.load(p_v, mask=mask_v, other=0.0).to(compute_dtype)
 
-        decay = tl.exp(b_w)  # [K]  d_t = exp(log-decay)
+        # Keep exp itself in fp32, then round to the selected recurrent compute
+        # dtype. The fp16-state fast path mirrors Albatross's half2 recurrence;
+        # the default fp32-state path retains the original numerical contract.
+        decay = tl.exp(b_w.to(tl.float32)).to(compute_dtype)
         b_b = b_kk * b_a  # [K]  b_kernel = kk * a
         # sa[v] = sum_k (-kk[k]) * S[k, v]  (uses PRE-update S)
-        sa = tl.sum((-b_kk)[:, None] * S, axis=0)  # [V]
+        sa = tl.sum((-b_kk)[:, None] * S, axis=0).to(compute_dtype)  # [V]
         # state update (RHS fully evaluated before assign -> all-old-S, matches oracle)
         S = (
             decay[:, None] * S
             + b_b[:, None] * sa[None, :]
             + b_k[:, None] * b_v[None, :]
-        )
+        ).to(compute_dtype)
         # o[v] = sum_k S[k, v] * (scale * r[k])
-        b_o = tl.sum(S * b_r[:, None], axis=0)  # [V]
+        b_o = tl.sum(S * b_r[:, None], axis=0).to(compute_dtype)  # [V]
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         # TARGET_VERIFY must leave the persistent state untouched until the
@@ -218,8 +234,8 @@ def wkv_recurrent(
         r, w, k, kk, a: `[B, T, H, K]`; `w` is log-decay, `kk` is L2-normalized.
         v: `[B, T, H, V]` (K == V == head_dim).
         scale: scalar applied to `r` (1.0 to match the numpy oracle).
-        initial_state: `[N, H, K, V]` fp32, or None (zero state).
-        output_final_state: also return the final `[N, H, K, V]` fp32 state.
+        initial_state: `[N, H, K, V]` state tensor, or None (zero state).
+        output_final_state: also return the final `[N, H, K, V]` state.
         cu_seqlens: `[N+1]` token offsets for packed varlen (B must be 1). None
             for the batched decode path (then N == B, T per request).
         reverse: must be False (the decode/recurrent paths never run in reverse).
@@ -243,6 +259,29 @@ def wkv_recurrent(
     if scale is None:
         scale = K**-0.5
 
+    if can_use_wkv_varlen_fp16_cuda(
+        r,
+        v,
+        state_pool,
+        cu_seqlens,
+        cache_indices,
+        update_state_pool,
+        intermediate_state,
+    ):
+        output = wkv_varlen_fp16_cuda(
+            r,
+            w,
+            k,
+            v,
+            kk,
+            a,
+            state_pool,
+            cu_seqlens.to(torch.int32),
+            cache_indices.to(torch.int32),
+            scale,
+        )
+        return output, None
+
     BK = triton.next_power_of_2(K)
     NV = triton.next_power_of_2(V)
     # Per-path launch config. BV (the V tile) and num_warps fix the thread layout
@@ -259,6 +298,22 @@ def wkv_recurrent(
     # batched == B=1) exact on knife-edge continuations under bf16.
     if cu_seqlens is None:
         BV, num_warps = min(32, NV), 4
+    elif (
+        r.dtype == torch.float16
+        and K == 64
+        and V == 64
+        and os.getenv("SGLANG_RWKV7_FAST_FP16_PREFILL", "0") == "1"
+    ):
+        # Ada B8 sweep (T=128/512/2048): BV=16, 1 warp is 2.43x-2.85x
+        # faster than the strict BV=16, 4-warp layout. The largest observed
+        # delta was one fp16 quarter-ULP in the output (2.44e-4) and <=5.97e-8
+        # in fp32 state. BF16 keeps the strict token-exact layout because its
+        # wider ULP can amplify a reduction-order change on knife-edge logits.
+        # Long-sequence greedy generation can amplify the different reduction
+        # order, so production defaults to the strict layout. Set
+        # SGLANG_RWKV7_FAST_FP16_PREFILL=1 only when the workload has passed
+        # the application's logit/token acceptance gate.
+        BV, num_warps = min(16, NV), 1
     else:
         BV, num_warps = min(16, NV), 4
     if _bv is not None:
@@ -271,6 +326,12 @@ def wkv_recurrent(
     # cache_indices[i] directly (state_pool is [size+1, H, K, V] fp32), skipping the
     # temporal[ci] gather + scatter the backend used to do. Same reduction math + bits.
     indexed = state_pool is not None
+    fp16_compute = bool(
+        indexed
+        and state_pool.dtype == torch.float16
+        and r.dtype == torch.float16
+        and os.getenv("SGLANG_RWKV7_FP16_STATE_COMPUTE", "1") != "0"
+    )
     store_intermediate = intermediate_state is not None
     if store_intermediate:
         if not indexed:
@@ -344,6 +405,7 @@ def wkv_recurrent(
         INTERMEDIATE_STEPS=(intermediate_state.shape[1] if store_intermediate else 0),
         IS_VARLEN=cu_seqlens is not None,
         INDEXED_STATE=indexed,
+        FP16_COMPUTE=fp16_compute,
         num_warps=num_warps,
     )
     return o, (None if indexed else ht_out)

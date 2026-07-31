@@ -23,7 +23,6 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -222,6 +221,32 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
         output_shape = [*x_q.shape[:-1], layer.weight.shape[1]]
 
+        # RWKV recurrent state magnifies tiny batch-layout-dependent rounding
+        # differences. For its latency-oriented token counts, accumulate in
+        # exact INT32 and apply scales afterward instead of using a split-K
+        # scaled kernel. Padding to a 32-row tile satisfies cuBLASLt's INT8
+        # contract while preserving exact per-row results across batch shapes.
+        exact_max_tokens = getattr(layer, "_rwkv7_int8_exact_max_tokens", 0)
+        if (
+            exact_max_tokens
+            and x_q_2d.is_cuda
+            and torch.version.hip is None
+            and x_q_2d.shape[0] <= exact_max_tokens
+            and x_q_2d.shape[1] % 8 == 0
+            and layer.weight.shape[1] % 8 == 0
+        ):
+            rows = x_q_2d.shape[0]
+            padded_rows = max(32, ((rows + 31) // 32) * 32)
+            if padded_rows != rows:
+                x_q_2d = torch.nn.functional.pad(x_q_2d, (0, 0, 0, padded_rows - rows))
+            accum = torch._int_mm(x_q_2d, layer.weight)[:rows]
+            output = accum.float()
+            output.mul_(x_scale_2d.float())
+            output.mul_(layer.weight_scale.t())
+            if bias is not None:
+                output.add_(bias.float())
+            return output.to(dtype=x.dtype).view(output_shape)
+
         output = int8_scaled_mm(
             x_q_2d,
             layer.weight,
@@ -258,8 +283,6 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
-
-        tp_size = get_parallel().tp_size
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(

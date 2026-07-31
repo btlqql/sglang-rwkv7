@@ -19,6 +19,7 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateDType,
     Rwkv7CacheParams,
     Rwkv7StateShape,
+    mamba2_state_dtype,
 )
 from sglang.srt.runtime_context import get_parallel
 
@@ -130,10 +131,14 @@ class Rwkv7Config(PretrainedConfig):
             num_heads=self.num_heads,
             head_dim=self.head_dim,
         )
-        # Keep BOTH conv (token-shift) and temporal (recurrent S) states in fp32:
-        # the default bf16 conv dtype would round the token-shift values and break
-        # exact greedy reproduction against the reference implementation.
-        dtype = Mamba2StateDType(conv=torch.float32, temporal=torch.float32)
+        # Token shift remains fp32 for exact greedy reproduction. The temporal
+        # state defaults to fp32 as well, but honors --mamba-ssm-dtype so an
+        # operator can select the Albatross-class fp16-state CUDA fast path.
+        # BF16/FP16 are explicit precision/performance modes, never silent casts.
+        dtype = Mamba2StateDType(
+            conv=torch.float32,
+            temporal=mamba2_state_dtype(self).temporal,
+        )
         return Rwkv7CacheParams(shape=shape, layers=self.linear_layer_ids, dtype=dtype)
 
 

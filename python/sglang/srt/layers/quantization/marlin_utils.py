@@ -63,10 +63,10 @@ FP4_MARLIN_SUPPORTED_GROUP_SIZES = [16, 32]
 USE_FP32_REDUCE_DEFAULT = True
 
 
-def online_marlin_quantize_weight(
-    weight: torch.Tensor, group_size: int = 128
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize an ordinary ``[out, in]`` HF weight to Marlin W4 in memory."""
+def _online_marlin_quantize_components(
+    weight: torch.Tensor, group_size: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return Marlin tensors plus a row-major per-channel INT8 shadow."""
     from sglang.kernels.ops.quantization.gptq_marlin_repack import (
         gptq_marlin_repack,
     )
@@ -98,7 +98,39 @@ def online_marlin_quantize_weight(
         size_n=size_n,
         group_size=group_size,
     )
+    from sglang.srt.layers.quantization.online_utils import (
+        online_quantize_w8a8_int8_weight,
+    )
+
+    shadow_weight, shadow_scale = online_quantize_w8a8_int8_weight(weight)
+    return (
+        packed_marlin,
+        marlin_scales,
+        shadow_weight,
+        shadow_scale,
+    )
+
+
+def online_marlin_quantize_weight(
+    weight: torch.Tensor, group_size: int = 128
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize an ordinary ``[out, in]`` HF weight to Marlin W4 in memory."""
+    packed_marlin, marlin_scales, _, _ = _online_marlin_quantize_components(
+        weight, group_size
+    )
     return packed_marlin, marlin_scales
+
+
+def online_marlin_quantize_weight_with_int8_shadow(
+    weight: torch.Tensor, group_size: int = 128
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize for Marlin and retain a compact deterministic small-M layout.
+
+    Marlin's packed layout remains the throughput path. The per-channel INT8
+    shadow is consumed only by recurrent models that need fixed-shape fused
+    accumulation independent of the active token-row count.
+    """
+    return _online_marlin_quantize_components(weight, group_size)
 
 
 @dataclass
@@ -915,22 +947,68 @@ class MarlinLinearMethod(LinearMethodBase):
         size_k = x_2d.shape[1]
         size_n = scales.shape[1]
 
-        output_2d = gptq_marlin_gemm(
-            x_2d,
-            None,
-            qweight,
-            scales,
-            None,
-            None,
-            None,
-            None,
-            workspace,
-            scalar_types.uint4b8,
-            size_m=size_m,
-            size_n=size_n,
-            size_k=size_k,
-            use_fp32_reduce=False,
-        )
+        # Some recurrent models need batch-layout-invariant projection results:
+        # a one-ULP row-order change can accumulate through state and eventually
+        # change greedy output. Such a model may attach an exact dense or a
+        # compact INT8 shadow for small token batches while retaining packed
+        # Marlin weights for throughput-oriented prefill. The hook is opt-in
+        # and therefore has no memory or dispatch cost for ordinary layers.
+        dense_shadow = getattr(layer, "_rwkv7_decode_weight", None)
+        int8_shadow = getattr(layer, "_rwkv7_decode_qweight", None)
+        shadow_scales = getattr(layer, "_rwkv7_decode_scales", None)
+        fallback_max_tokens = getattr(layer, "_rwkv7_marlin_fallback_max_tokens", 0)
+        use_shadow = (
+            dense_shadow is not None
+            or (int8_shadow is not None and shadow_scales is not None)
+        ) and size_m <= fallback_max_tokens
+        if use_shadow and size_m > 8:
+            # Full-prefill CUDA Graphs replay the captured branch without
+            # re-entering Python. The generic capture-mode flag only covers
+            # decode graphs, while the prefill runner publishes this context
+            # for both warmup and capture. Keep full-prefill graphs on Marlin;
+            # eager short prefills use the checkpoint-selected accuracy shadow.
+            from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
+                get_tc_piecewise_forward_context,
+            )
+
+            forward_context = get_tc_piecewise_forward_context()
+            use_shadow = not (
+                forward_context is not None and forward_context.full_graph
+            )
+        if use_shadow and dense_shadow is not None:
+            output_2d = torch.nn.functional.linear(x_2d, dense_shadow)
+        elif use_shadow:
+            from sglang.srt.layers.quantization.rwkv7_w4 import (
+                rwkv7_w4_int8_shadow_gemm,
+            )
+
+            output_2d = rwkv7_w4_int8_shadow_gemm(
+                x_2d,
+                int8_shadow,
+                shadow_scales,
+                group_size=(
+                    size_k
+                    if self.quant_config.group_size == -1
+                    else self.quant_config.group_size
+                ),
+            )
+        else:
+            output_2d = gptq_marlin_gemm(
+                x_2d,
+                None,
+                qweight,
+                scales,
+                None,
+                None,
+                None,
+                None,
+                workspace,
+                scalar_types.uint4b8,
+                size_m=size_m,
+                size_n=size_n,
+                size_k=size_k,
+                use_fp32_reduce=False,
+            )
 
         output = output_2d.view(x.shape[:-1] + (output_2d.shape[1],))
 

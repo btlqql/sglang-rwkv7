@@ -160,18 +160,36 @@ if _use_aiter:
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
 
+_has_sgl_kernel_fp8 = False
 if _is_cuda:
-    from sgl_kernel import fp8_scaled_mm
+    try:
+        from sgl_kernel import fp8_scaled_mm
+
+        _has_sgl_kernel_fp8 = True
+    except (ImportError, OSError) as exc:
+        # fp8_utils is imported by dense communication paths as well as FP8
+        # quantizers. A missing or architecture-mismatched optional kernel
+        # wheel must not prevent an unquantized model from starting. FP8 GEMMs
+        # continue through the Triton/torch fallbacks selected below.
+        logger.warning(
+            "sgl-kernel FP8 GEMM is unavailable (%s); using portable FP8 fallbacks.",
+            exc,
+        )
 
     from sglang.kernels.ops.gemm.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 
-    @register_fake_if_exists("sgl_kernel::fp8_scaled_mm")
-    def _fp8_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
-        # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite layout; output is [M, N].
-        M = mat_a.shape[-2]
-        N = mat_b.shape[-1]
-        return mat_a.new_empty((M, N), dtype=out_dtype)
+    if _has_sgl_kernel_fp8:
+
+        @register_fake_if_exists("sgl_kernel::fp8_scaled_mm")
+        def _fp8_scaled_mm_abstract(
+            mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None
+        ):
+            # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite
+            # layout; output is [M, N].
+            M = mat_a.shape[-2]
+            N = mat_b.shape[-1]
+            return mat_a.new_empty((M, N), dtype=out_dtype)
 
     from flashinfer import bmm_fp8 as _raw_bmm_fp8_batched
 
@@ -226,7 +244,7 @@ USE_ROWWISE_TORCH_SCALED_MM = use_rowwise_torch_scaled_mm()
 
 @lru_cache(maxsize=1)
 def cutlass_fp8_supported():
-    if not _is_cuda:
+    if not _is_cuda or not _has_sgl_kernel_fp8:
         return False
     major, minor = get_device_capability()
     cuda_version = get_cuda_version()

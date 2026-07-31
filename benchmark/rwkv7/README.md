@@ -1,59 +1,166 @@
-# RWKV-7 serving acceptance
+# RWKV-7 serving benchmarks
 
-This directory provides a fixed-shape benchmark for comparing RWKV-7 serving
-configurations without changing the workload between runs.
+This directory contains the reproducible correctness, serving-feature, and
+performance harnesses for native RWKV-7 in SGLang.
 
-## Reference workload
+- Acceptance contract: [`RWKV7_HF_PARITY.md`](../../RWKV7_HF_PARITY.md)
+- Current RTX 4080 snapshot: [`RESULTS_4080.md`](RESULTS_4080.md)
 
-- batch size: 8;
-- input length: 128 tokens per request;
-- output length: 64 tokens per request;
-- greedy decoding with EOS ignored;
-- decode CUDA graph captured through batch size 8;
-- two warm-up runs and the median of three measured runs;
-- the recurrent radix cache is flushed before every run.
+A single microbenchmark is not an acceptance result. Promote a configuration
+only after the same model, dtype, state precision, graph mode, batch, prompt,
+and decode lengths pass correctness, memory, and end-to-end serving gates.
 
-Start an unquantized server:
+## HF-standard batch matrix
+
+`bench_acceptance_matrix.py` drives the streaming API and records TTFT, prefill
+throughput, TPOT, decode throughput, end-to-end output throughput, raw samples,
+and provenance in JSONL.
+
+```bash
+python benchmark/rwkv7/bench_acceptance_matrix.py \
+  --model rwkv7-g1-1.5b \
+  --mode dense-fp16 \
+  --gpu 'NVIDIA GeForce RTX 4080' \
+  --repo-sha "$(git rev-parse HEAD)" \
+  --standard-sha f1b49bc52a050d09a6739bc4859850f5dc50e7ef \
+  --batch-sizes 1,2,4,8 \
+  --prompt-lengths 128,512,2048 \
+  --decode-lengths 128,512 \
+  --warmups 2 --repeats 5 \
+  --output /tmp/rwkv7-dense.jsonl
+```
+
+The full contract covers 1.5B/2.9B/7.2B and dense/W8/W4, for 216 cells per
+hardware target. `--no-flush-cache` is diagnostic only; acceptance runs flush
+the recurrent radix cache before every sample.
+
+`analyze_acceptance_matrix.py` joins candidate rows to matched Qwen3.5 JSONL
+and raw Albatross `RESULT` logs. It keeps missing candidate and baseline cells
+in the denominator and can fail CI when any required speed gate is red:
+
+```bash
+python benchmark/rwkv7/analyze_acceptance_matrix.py \
+  --candidate results/rwkv-dense.jsonl \
+  --candidate results/rwkv-w8.jsonl \
+  --candidate results/rwkv-w4.jsonl \
+  --memory results/model-memory.jsonl \
+  --qwen rwkv7-g1-1.5b=results/qwen3.5-2b.jsonl \
+  --qwen rwkv7-g1-2.9b=results/qwen3.5-4b.jsonl \
+  --qwen rwkv7-g1-7.2b=results/qwen3.5-9b.jsonl \
+  --albatross rwkv7-g1-1.5b=results/albatross-1.5b.log \
+  --albatross rwkv7-g1-2.9b=results/albatross-2.9b.log \
+  --albatross rwkv7-g1-7.2b=results/albatross-7.2b.log \
+  --active-work-factor rwkv7-g1-1.5b=1.3333333333 \
+  --active-work-factor rwkv7-g1-2.9b=1.3793103448 \
+  --active-work-factor rwkv7-g1-7.2b=1.25 \
+  --active-work-minimum rwkv7-g1-1.5b=1.75 \
+  --active-work-minimum rwkv7-g1-2.9b=1.75 \
+  --active-work-minimum rwkv7-g1-7.2b=1.75 \
+  --qwen-decode-batch-sizes 8 \
+  --require-active-work --require-memory --strict \
+  --output results/acceptance-report.json
+```
+
+Active-work factors and thresholds are explicit inputs so a model-pair change
+cannot silently alter the rule. The agreed cross-architecture decode, TPOT,
+E2E, and active-work gates apply at batch 8; Qwen prefill and TTFT still gate
+every batch. All Qwen batch rows remain in the artifact even when they are not
+decode gates. Albatross has no HTTP serving boundary, so its fixed-forward rows
+gate prefill and decode only.
+
+The optional memory input becomes mandatory with `--require-memory`. It uses
+one record per model and mode; quantized model-weight memory must be strictly
+lower than the matched dense record:
+
+```json
+{"schema":"rwkv7-serving-memory-v1","model":"rwkv7-g1-1.5b","mode":"dense","model_weight_memory_gb":3.03}
+{"schema":"rwkv7-serving-memory-v1","model":"rwkv7-g1-1.5b","mode":"w8-accuracy","model_weight_memory_gb":2.69}
+```
+
+Server peak, active-state, and configured state-pool memory may be retained as
+additional fields. They do not replace `model_weight_memory_gb`, because a
+fixed `mem_fraction_static` can otherwise hide a real weight-memory reduction.
+
+## Dense server
+
+The strict state-cache lane keeps recurrent state in FP32:
 
 ```bash
 python -m sglang.launch_server \
   --model-path /path/to/rwkv7-hf \
   --trust-remote-code \
   --attention-backend triton \
-  --dtype bfloat16 \
-  --chunked-prefill-size 64 \
+  --dtype float16 \
+  --mamba-ssm-dtype float32 \
+  --chunked-prefill-size 16384 \
+  --max-prefill-tokens 16384 \
   --cuda-graph-max-bs-decode 8 \
-  --max-running-requests 16
+  --max-running-requests 16 \
+  --cuda-graph-config \
+  '{"decode":{"backend":"full","bs":[1,2,4,8]},"prefill":{"backend":"full","bs":[128,256,512,1024,2048,4096,8192,16384],"full_prefill_max_req":8}}'
 ```
 
-Run the benchmark:
+The prefill capture list is the set of distinct aggregate token counts in the
+HF matrix (`batch_size * prompt_length`). Omitting the 128/256/512/2048/8192
+buckets pads several bsz 1/2/4 cells into a larger graph and can nearly halve
+reported throughput. Full-prefill graphs are currently an explicit fixed-shape
+performance lane; dynamic shapes, chunked requests, and uncaptured sizes retain
+their normal fallback paths.
 
-```bash
-python benchmark/rwkv7/bench_serving.py \
-  --batch-size 8 --input-len 128 --output-len 64 \
-  --warmups 2 --repeats 3
+`--mamba-ssm-dtype float16` selects the Ada FP16-state performance lane and its
+optional native packed-varlen CUDA WKV kernel. It lowers state memory and raises
+throughput, but is not token-exact across every long chunk boundary. Use it only
+when the target workload passes its logit/token gate. Disable the optional CUDA
+kernel with `SGLANG_RWKV7_CUDA_FP16_WKV=0` to exercise the portable Triton
+fallback.
+
+`SGLANG_RWKV7_FAST_FP16_PREFILL=1` changes the Triton reduction layout for an
+additional experimental FP16 prefill fast path. It is opt-in because long
+free-running generation can amplify the reduction-order difference.
+
+The low-precision serving path automatically fuses token shift with the six
+time-mix streams and fuses per-head GroupNorm with recurrent correction and
+the output gate. The FP32 lane retains the strict ATen path. Promotion requires
+the kernel tolerance tests plus the dense/quantized logit and greedy gates; no
+environment switch is needed for the promoted fusions.
+
+## Quantized servers
+
+RWKV-7 applies model-specific mixed-precision policies to online W8 and W4.
+The default is `accuracy`; the alternatives are explicit trade-offs:
+
+```text
+SGLANG_RWKV7_W8_POLICY=accuracy|balanced|speed
+SGLANG_RWKV7_W4_POLICY=accuracy|balanced|speed
 ```
 
-Use the same command after restarting the server with one of the online
-quantization configurations below.
+Low-rank controls and lm_head stay dense for these paths. The recurrent WKV
+state is not weight-quantized.
 
-### W8A8
+### W8A8 INT8
 
 ```bash
+SGLANG_RWKV7_W8_POLICY=accuracy \
 python -m sglang.launch_server \
   --model-path /path/to/rwkv7-hf \
   --trust-remote-code \
   --attention-backend triton \
-  --dtype bfloat16 \
+  --dtype float16 \
+  --mamba-ssm-dtype float32 \
   --quantization w8a8_int8 \
-  --chunked-prefill-size 64 \
+  --chunked-prefill-size 16384 \
   --cuda-graph-max-bs-decode 8 \
   --max-running-requests 16
 ```
 
-### Marlin W4 (SM80+)
+The RTX 4080 accuracy policy keeps recurrent attention and the sqReLU expansion
+dense, and quantizes the middle FFN value projections. FP32 recurrent state is
+required for the strict cold/warm cache-continuation gate in the current build.
+
+### Online Marlin W4 (SM80+)
 
 ```bash
+SGLANG_RWKV7_W4_POLICY=accuracy \
 python -m sglang.launch_server \
   --model-path /path/to/rwkv7-hf \
   --trust-remote-code \
@@ -62,26 +169,79 @@ python -m sglang.launch_server \
   --quantization marlin \
   --model-loader-extra-config \
     '{"online_quantization":true,"group_size":128}' \
-  --chunked-prefill-size 64 \
+  --chunked-prefill-size 16384 \
   --cuda-graph-max-bs-decode 8 \
   --max-running-requests 16
 ```
 
-## RTX 4080 snapshot
+The W4 accuracy policy keeps attention and edge FFN layers dense. In the
+middle stack, alternating FFN key projections use W4 Marlin; the remaining key
+and value projections use W8A8. For key projections, small batches of at most
+512 tokens use a compact per-channel INT8 shadow: decode uses a fixed 32-row
+fused kernel, and larger short prefills reconstruct the quantized dense weight
+without retaining an FP16 copy. Larger prefills use packed Marlin. W8
+contractions use the exact small-token path. This hybrid keeps a W4
+memory/decode benefit without the large-batch pure-Marlin prefill regression.
+`balanced` and `speed` remain pure-W4 policies. Group size 128 is the supported
+online Marlin setting in the validated environment. The two cutoffs can be
+overridden with `SGLANG_RWKV7_MARLIN_FALLBACK_MAX_TOKENS` and
+`SGLANG_RWKV7_INT8_EXACT_MAX_TOKENS` after repeating the correctness gate.
 
-The native RWKV-7 1.5B checkpoint produced the following medians with the
-workload above on an RTX 4080. These values are a hardware snapshot; the ratio
-is the acceptance signal.
+## Quantized alignment
 
-| Mode | Model-weight memory reported while loading | Output tok/s | Ratio to BF16 |
-| --- | ---: | ---: | ---: |
-| BF16 | 3.03 GB | 679.47 | 1.000x |
-| online W8A8 | about 1.7 GB | 711.15 | 1.047x |
-| online Marlin W4 | 0.66 GB | 816.54 | 1.202x |
+`verify_quant_alignment.py` generates a continuation with dense Hugging Face,
+then teacher-forces that exact continuation through an already-running
+quantized SGLang server. It reports chosen-token logprob error, top-k overlap,
+teacher-forced top-1 agreement, and a free-running prefix diagnostic.
 
-The online W8A8 and W4 paths leave RWKV's small low-rank control projections in
-the activation dtype. Quantizing those projections saves little memory while
-adding poorly shaped quantized matrix multiplications on every layer.
+```bash
+python benchmark/rwkv7/verify_quant_alignment.py \
+  --model /path/to/rwkv7-hf \
+  --base-url http://127.0.0.1:30000 \
+  --dtype float16 \
+  --max-new-tokens 32 \
+  --top-k 10
+```
+
+The default W8 gate is max chosen-token logprob error `<= 0.25`, mean top-10
+overlap `>= 0.80`, and teacher-forced top-1 agreement `>= 0.90`. A W4 run may
+use a separately justified threshold, but a relaxed gate must be named in the
+result rather than silently replacing the W8 threshold.
+
+For a model whose dense reference and quantized server do not fit on one GPU,
+split reference generation and scoring into fresh processes:
+
+```bash
+# Dense server is stopped; only the HF model occupies the GPU.
+python benchmark/rwkv7/verify_quant_alignment.py \
+  --model /path/to/rwkv7-hf \
+  --reference-only \
+  --reference-output /tmp/rwkv7-7.2b-reference.json
+
+# Dense HF memory is released; start the quantized SGLang server, then score.
+python benchmark/rwkv7/verify_quant_alignment.py \
+  --model /path/to/rwkv7-hf \
+  --reference-input /tmp/rwkv7-7.2b-reference.json \
+  --base-url http://127.0.0.1:30000
+```
+
+The loader rejects reference files whose dtype, generation length, top-k
+width, or per-token array lengths do not match the requested scoring run.
+
+## Serving-feature gate
+
+Run this against every promoted dense or quantized server:
+
+```bash
+python benchmark/rwkv7/verify_serving_features.py \
+  --base-url http://127.0.0.1:30000
+```
+
+The harness checks deterministic replay, duplicate-request state isolation,
+chunked-prefill cold/warm equality, and an exact 128-token recurrent cache hit.
+For a diagnostic quantized run, `--single-batch-prefix-tokens 0` disables only
+the single-vs-batched prefix check; it does not disable cache equality or state
+isolation.
 
 ## Legacy CUDA validation (V100 / SM70)
 
@@ -186,12 +346,37 @@ python -m sglang.launch_server \
   --model-path /path/to/rwkv7-target \
   --trust-remote-code \
   --attention-backend triton \
+  --max-running-requests 8 \
+  --max-mamba-cache-size 24 \
+  --cuda-graph-max-bs-decode 8 \
   --speculative-algorithm STANDALONE \
   --speculative-draft-model-path /path/to/rwkv7-draft \
   --speculative-num-steps 3 \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4 \
   --disable-overlap-schedule
+```
+
+RWKV-7 currently reserves three recurrent state paths per running speculative
+request. Consequently, a true batch size of eight requires
+`--max-mamba-cache-size 24`; setting it to 16 caps the effective running batch
+at five even when `--max-running-requests 8` is present.
+
+Use the paired serving harness to measure baseline and speculative endpoints
+with identical fixed-batch inputs. It requires exact greedy token IDs and
+records TTFT, prefill/decode/end-to-end throughput, draft acceptance counters,
+and the server-wide average accept length:
+
+```bash
+python benchmark/rwkv7/bench_speculative.py \
+  --baseline-url http://127.0.0.1:30001 \
+  --spec-url http://127.0.0.1:30000 \
+  --batch-sizes 8 \
+  --prompt-lengths 128,512,2048 \
+  --decode-lengths 128,512 \
+  --target-model rwkv7-g1g-1.5b \
+  --draft-model rwkv7-g1d-0.4b \
+  --output rwkv7-speculative.jsonl
 ```
 
 The end-to-end gate is
@@ -209,7 +394,9 @@ Hardware validation snapshots:
 | RTX 4080 | RWKV-7 1.5B, FP16 | 1 | 128-token cache hit + 16-token decode | cold/warm exact |
 | V100 | RWKV-7 0.1B, FP16 | 1, 2 | 32 tokens | exact vs. non-speculative |
 
-For decode CUDA Graphs, target verify and multi-step draft decode are captured;
-RWKV draft extend currently remains eager. On legacy CUDA systems without a
-compatible `sgl_kernel`, speculative tree construction and greedy verification
-fall back to the in-tree Triton kernels.
+For decode CUDA Graphs, target verify, multi-step draft decode, and the fixed
+width RWKV draft-extend pass are captured. Draft extend uses graph-stable
+request-to-state indices and query offsets; other linear or hybrid architectures
+remain eager unless their backend explicitly declares the same contract. On
+legacy CUDA systems without a compatible `sgl_kernel`, speculative tree
+construction and greedy verification fall back to the in-tree Triton kernels.
