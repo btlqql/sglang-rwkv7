@@ -25,3 +25,17 @@ The first matrix command accidentally supplied the Albatross commit in the
 `standard_sha` field. The checked-in JSONL corrects that metadata to the pinned
 HF acceptance commit from `environment.json`; numeric measurements, samples,
 model code SHA, and baseline files are unchanged.
+
+## Production-safe 2.9B W4 update
+
+Commit `d17883f3f671adb8d0998034072649a88931e95d` adds a safer 2.9B W4 hybrid
+lane after the earlier high-compression policy exposed batch-layout-sensitive
+long greedy continuations. Its committed batch-8 evidence covers all six
+128/512/2048 prefill by 128/512 decode cells. Minimum gains over matched dense
+are 1.118x prefill, 1.099x decode, and 1.101x end to end; model-weight memory is
+5.00 GB versus 5.68 GB dense. It also passes the strict quant alignment gate,
+full cold/warm chunked-prefill equality, state-cache hit, mixed-length
+compaction, abort, and post-abort slot-reuse checks. See the three
+`rwkv7-g1-2.9b/w4-hybrid-safe-d17883f3*` artifacts. The serving report
+explicitly records a two-token repeat/duplicate prefix gate rather than
+claiming bit-exact long synthetic quantized generation.

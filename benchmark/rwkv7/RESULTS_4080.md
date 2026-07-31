@@ -40,11 +40,13 @@ The default policy is `accuracy`.
 | Mode | Quantized projections | Dense protections |
 | --- | --- | --- |
 | W8 accuracy | middle FFN value projections | attention, FFN key, first/last FFN value, low-rank controls, lm_head |
-| W4 hybrid accuracy | middle-layer FFN key/value, interleaved W4/W8 by layer | attention, first/last four FFN blocks, low-rank controls, lm_head |
+| W4 hybrid accuracy | alternating middle FFN key projections in W4; remaining middle key/value projections in W8 | attention, first/last four FFN blocks, low-rank controls, lm_head |
 
 `balanced` and `speed` are explicit pure-W4 opt-in policies. The default hybrid
-accuracy policy keeps meaningful W4 coverage but uses W8 in alternating middle
-FFN blocks to close Marlin's large-batch prefill gap.
+accuracy policy keeps meaningful W4 coverage for large prefills. For small
+token batches it uses an FP16 shard of the W4 key projection, and W8 uses exact
+INT32 accumulation, because recurrent state can amplify row-layout rounding
+into different long greedy continuations.
 
 ## Model-weight memory
 
@@ -122,6 +124,53 @@ alignment gate also passes:
 | --- | ---: | ---: | ---: | ---: | --- |
 | W8 accuracy | 0.1322 | 0.0180 | 0.9625 | 0.9844 | pass (`0.25 / 0.80 / 0.90`) |
 | W4 hybrid accuracy | 0.6088 | 0.0632 | 0.9203 | 0.9531 | pass (`1.00 / 0.80 / 0.90`) |
+
+### 2.9B production-safe W4 batch-8 slice (`d17883f3`)
+
+The earlier 4.28 GB W4 matrix above is retained as a high-compression
+performance experiment, but its small-M Marlin path did not pass repeated and
+mixed-length serving checks. Commit `d17883f3f671adb8d0998034072649a88931e95d`
+therefore adds a production-safe hybrid path:
+
+- W4 Marlin remains active for large prefills;
+- small W4 key projections use their original FP16 shard;
+- W8 projections use exact INT32 accumulation up to 1,024 packed tokens;
+- fresh/reused recurrent slots are cleared or restored before full-graph replay.
+
+The resulting model-weight load is 5.00 GB versus 5.68 GB dense, a 12.0%
+reduction. The committed batch-8 matrix uses two warm-ups and five measured
+samples per cell:
+
+| Prompt | Decode | Prefill tok/s | Decode tok/s | E2E tok/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 128 | 14,261.0 | 824.9 | 785.5 |
+| 128 | 512 | 14,268.8 | 825.0 | 814.8 |
+| 512 | 128 | 16,670.2 | 824.2 | 692.5 |
+| 512 | 512 | 16,652.5 | 824.5 | 787.1 |
+| 2048 | 128 | 16,045.0 | 824.0 | 454.3 |
+| 2048 | 512 | 16,041.5 | 824.3 | 684.7 |
+
+Across these six cells, the minimum ratios are 1.118x prefill, 1.099x decode,
+and 1.101x end to end against the matched dense 2.9B lane. Against the fresh
+Albatross 2.9B batch-8 reference, the minima are 1.039x prefill and 1.177x
+decode. Against the same-runtime Qwen3.5-4B batch-8 baseline, the minima are
+1.417x prefill, 1.650x decode, and 1.615x end to end, exceeding the simple
+4.0B/2.9B active-parameter proportional decode target.
+
+The strict quantized alignment gate passes at 0.2357 maximum chosen-token
+logprob error, 0.9758 mean top-10 overlap, and 0.9766 teacher-forced top-1
+agreement (`0.25 / 0.80 / 0.90`). The production lifecycle harness also passes
+mixed-length compaction, explicit abort, post-abort slot reuse, full cold/warm
+chunked-prefill equality, and a 128-token state-cache hit. Long synthetic
+quantized continuations are not claimed bit-exact: the serving artifact records
+a two-token repeat/duplicate prefix gate, while natural-prompt quality is
+measured by the teacher-forced alignment report.
+
+Raw evidence:
+
+- `rwkv7-g1-2.9b/w4-hybrid-safe-d17883f3.jsonl`
+- `rwkv7-g1-2.9b/w4-hybrid-safe-d17883f3-alignment.json`
+- `rwkv7-g1-2.9b/w4-hybrid-safe-d17883f3-serving.json`
 
 ## 7.2B quantized capacity lane
 
