@@ -145,6 +145,39 @@ def _rwkv7_w4_policy() -> str:
     return policy
 
 
+def _rwkv7_marlin_fallback_max_tokens() -> int:
+    """Token-count limit for the batch-invariant dense W4 accuracy fallback."""
+    raw = os.getenv("SGLANG_RWKV7_MARLIN_FALLBACK_MAX_TOKENS", "1024")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"SGLANG_RWKV7_MARLIN_FALLBACK_MAX_TOKENS must be an integer; got {raw!r}."
+        ) from exc
+    if value < 0:
+        raise ValueError(
+            "SGLANG_RWKV7_MARLIN_FALLBACK_MAX_TOKENS must be non-negative; "
+            f"got {value}."
+        )
+    return value
+
+
+def _rwkv7_int8_exact_max_tokens() -> int:
+    """Token-count limit for batch-invariant INT32 W8A8 accumulation."""
+    raw = os.getenv("SGLANG_RWKV7_INT8_EXACT_MAX_TOKENS", "1024")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"SGLANG_RWKV7_INT8_EXACT_MAX_TOKENS must be an integer; got {raw!r}."
+        ) from exc
+    if value < 0:
+        raise ValueError(
+            f"SGLANG_RWKV7_INT8_EXACT_MAX_TOKENS must be non-negative; got {value}."
+        )
+    return value
+
+
 def _rwkv7_w8a8_config() -> QuantizationConfig:
     """Lazily import W8A8 so legacy CUDA dense/BnB paths need no sgl-kernel."""
     global _RWKV7_W8A8_CONFIG
@@ -167,8 +200,10 @@ def _rwkv7_projection_quant_config(
     The speed policies quantize every large projection. Balanced policies keep
     recurrent attention dense. Accuracy policies additionally protect the W8
     sqReLU expansion and the most sensitive edge FFN layers. The W4 accuracy
-    lane interleaves W4 and W8 in its middle FFN layers: W4 retains most of the
-    compression/decode gain while W8 closes Marlin's large-batch prefill gap.
+    lane uses W4 only for alternating middle FFN expansion projections. The
+    contraction projection stays W8: repeated-request testing found that its
+    small-M Marlin reduction can flip near-tied greedy logits, while W4 on the
+    expansion remains deterministic and retains a real W4 memory/speed lane.
     """
     if quant_config is None:
         return None
@@ -202,7 +237,7 @@ def _rwkv7_projection_quant_config(
             edge_layers = min(4, max(1, num_hidden_layers // 6))
             if layer_id < edge_layers or layer_id >= num_hidden_layers - edge_layers:
                 return None
-            if layer_id % 2:
+            if projection == "ffn_value" or layer_id % 2:
                 return _rwkv7_w8a8_config()
 
     return quant_config
@@ -239,6 +274,8 @@ def _make_proj(
         m = ReplicatedLinear(
             in_f, out_f, bias=False, quant_config=quant_config, prefix=prefix
         )
+    if quant_config is not None and quant_config.get_name() == "w8a8_int8":
+        m._rwkv7_int8_exact_max_tokens = _rwkv7_int8_exact_max_tokens()
     return m
 
 
@@ -692,6 +729,29 @@ class Rwkv7FeedForward(nn.Module):
         # tp>1: key is column-parallel (local inter slice; sqrelu is elementwise so
         # it acts per-slice), value is row-parallel (allreduce restores the full H).
         self.key = _make_proj(H, inter, key_quant_config, add_prefix("key", prefix))
+        if (
+            key_quant_config is not None
+            and key_quant_config.get_name() == "marlin"
+            and _rwkv7_w4_policy() == "accuracy"
+        ):
+            # Marlin remains the throughput path for large prefills.  Small
+            # token batches use the original FP16 shard to make recurrent
+            # output independent of row placement and dynamic-batch compaction.
+            # Non-persistent avoids duplicating this derived buffer on save.
+            local_inter = self.key.s.shape[1]
+            self.key.register_buffer(
+                "_rwkv7_decode_weight",
+                torch.empty(
+                    local_inter,
+                    H,
+                    dtype=self.key.s.dtype,
+                    device=self.key.s.device,
+                ),
+                persistent=False,
+            )
+            self.key._rwkv7_marlin_fallback_max_tokens = (
+                _rwkv7_marlin_fallback_max_tokens()
+            )
         value_quant_config = _rwkv7_projection_quant_config(
             quant_config,
             "ffn_value",
@@ -1006,6 +1066,22 @@ class Rwkv7ForCausalLM(nn.Module):
                     loaded_weight,
                     group_size=self.quant_config.group_size,
                 )
+                dense_fallback_name = marlin_prefix + "._rwkv7_decode_weight"
+                if dense_fallback_name in params_dict:
+                    dense_fallback = params_dict[dense_fallback_name]
+                    fallback_weight = loaded_weight
+                    if fallback_weight.shape != dense_fallback.shape:
+                        shard = dense_fallback.shape[0]
+                        fallback_weight = fallback_weight.narrow(
+                            0, tp_rank * shard, shard
+                        )
+                    dense_fallback.copy_(
+                        fallback_weight.to(
+                            device=dense_fallback.device,
+                            dtype=dense_fallback.dtype,
+                        )
+                    )
+                    loaded_params.add(dense_fallback_name)
                 for target_name, tensor in (
                     (marlin_weight_name, packed_weight),
                     (marlin_scale_name, weight_scale),

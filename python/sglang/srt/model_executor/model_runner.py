@@ -403,9 +403,9 @@ class ModelRunner:
         )
 
         if self.ps.pp_size > 1:
-            assert (
-                self.support_pp
-            ), "Pipeline Parallel is not compatible with this model."
+            assert self.support_pp, (
+                "Pipeline Parallel is not compatible with this model."
+            )
 
         # For weight updates
         self.init_weight_updater()
@@ -1542,6 +1542,13 @@ class ModelRunner:
 
             # Replay cuda graph if applicable
             if can_run_graph:
+                # Full-prefill graphs can be the first forward for a newly
+                # allocated recurrent request.  Its slot clear (or radix-cache
+                # COW restore) is deliberately deferred to the model forward
+                # stream, so it must run before graph replay.  Returning here
+                # without the deferred op lets a recycled Mamba/RWKV slot feed
+                # stale state into the captured prefill.
+                self._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
                 ret = self.decode_cuda_graph_runner.execute(
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,

@@ -2,7 +2,11 @@ import os
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.models.rwkv7 import _rwkv7_projection_quant_config
+from sglang.srt.models.rwkv7 import (
+    _rwkv7_int8_exact_max_tokens,
+    _rwkv7_marlin_fallback_max_tokens,
+    _rwkv7_projection_quant_config,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -37,11 +41,14 @@ class TestRwkv7QuantPolicy(unittest.TestCase):
                 quant,
             )
 
-    def test_w4_accuracy_interleaves_w4_and_w8_in_middle_ffn_layers(self):
+    def test_w4_accuracy_uses_w4_expansion_and_w8_contraction(self):
         quant = FakeQuantConfig("marlin")
-        with patch.dict(os.environ, {"SGLANG_RWKV7_W4_POLICY": "accuracy"}), patch(
-            "sglang.srt.models.rwkv7._rwkv7_w8a8_config",
-            return_value=FakeQuantConfig("w8a8_int8"),
+        with (
+            patch.dict(os.environ, {"SGLANG_RWKV7_W4_POLICY": "accuracy"}),
+            patch(
+                "sglang.srt.models.rwkv7._rwkv7_w8a8_config",
+                return_value=FakeQuantConfig("w8a8_int8"),
+            ),
         ):
             self.assertIsNone(
                 _rwkv7_projection_quant_config(quant, "attention", 12, 24)
@@ -52,6 +59,10 @@ class TestRwkv7QuantPolicy(unittest.TestCase):
                 )
             self.assertIs(
                 _rwkv7_projection_quant_config(quant, "ffn_key", 12, 24), quant
+            )
+            self.assertEqual(
+                _rwkv7_projection_quant_config(quant, "ffn_value", 12, 24).get_name(),
+                "w8a8_int8",
             )
             self.assertEqual(
                 _rwkv7_projection_quant_config(quant, "ffn_key", 13, 24).get_name(),
@@ -110,6 +121,30 @@ class TestRwkv7QuantPolicy(unittest.TestCase):
         with patch.dict(os.environ, {"SGLANG_RWKV7_W8_POLICY": "unknown"}):
             with self.assertRaisesRegex(ValueError, "accuracy, balanced, or speed"):
                 _rwkv7_projection_quant_config(quant, "attention", 0, 24)
+
+    def test_marlin_fallback_limit_is_configurable(self):
+        with patch.dict(
+            os.environ, {"SGLANG_RWKV7_MARLIN_FALLBACK_MAX_TOKENS": "2048"}
+        ):
+            self.assertEqual(_rwkv7_marlin_fallback_max_tokens(), 2048)
+        with patch.dict(os.environ, {"SGLANG_RWKV7_MARLIN_FALLBACK_MAX_TOKENS": "-1"}):
+            with self.assertRaisesRegex(ValueError, "must be non-negative"):
+                _rwkv7_marlin_fallback_max_tokens()
+        with patch.dict(
+            os.environ, {"SGLANG_RWKV7_MARLIN_FALLBACK_MAX_TOKENS": "many"}
+        ):
+            with self.assertRaisesRegex(ValueError, "must be an integer"):
+                _rwkv7_marlin_fallback_max_tokens()
+
+    def test_int8_exact_limit_is_configurable(self):
+        with patch.dict(os.environ, {"SGLANG_RWKV7_INT8_EXACT_MAX_TOKENS": "2048"}):
+            self.assertEqual(_rwkv7_int8_exact_max_tokens(), 2048)
+        with patch.dict(os.environ, {"SGLANG_RWKV7_INT8_EXACT_MAX_TOKENS": "-1"}):
+            with self.assertRaisesRegex(ValueError, "must be non-negative"):
+                _rwkv7_int8_exact_max_tokens()
+        with patch.dict(os.environ, {"SGLANG_RWKV7_INT8_EXACT_MAX_TOKENS": "many"}):
+            with self.assertRaisesRegex(ValueError, "must be an integer"):
+                _rwkv7_int8_exact_max_tokens()
 
 
 if __name__ == "__main__":

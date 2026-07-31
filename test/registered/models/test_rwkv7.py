@@ -15,11 +15,20 @@ constant-state recurrent model:
      batch-size-dependent cuBLAS reduction-order drift needs many tokens
      of autoregressive accumulation to surface),
   4. chunked prefill and recurrent-state prefix-cache restoration preserve
-     greedy output while reporting a real cache hit.
+     greedy output while reporting a real cache hit,
+  5. mixed output lengths can compact a running batch without moving another
+     request's recurrent state,
+  6. aborting an in-flight request releases its recurrent state before the
+     scheduler reuses that pool slot.
 """
 
 import os
+import threading
+import time
 import unittest
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 import requests
 
@@ -108,17 +117,20 @@ class TestRwkv7Server(CustomTestCase):
         resp.raise_for_status()
         return resp.json()
 
-    def _generate_ids(self, input_ids, max_new_tokens=16):
+    def _generate_ids(self, input_ids, max_new_tokens=16, rid=None):
+        payload = {
+            "input_ids": input_ids,
+            "sampling_params": {
+                "temperature": 0.0,
+                "max_new_tokens": max_new_tokens,
+                "ignore_eos": True,
+            },
+        }
+        if rid is not None:
+            payload["rid"] = rid
         resp = requests.post(
             f"{self.base_url}/generate",
-            json={
-                "input_ids": input_ids,
-                "sampling_params": {
-                    "temperature": 0.0,
-                    "max_new_tokens": max_new_tokens,
-                    "ignore_eos": True,
-                },
-            },
+            json=payload,
             timeout=120,
         )
         resp.raise_for_status()
@@ -232,6 +244,123 @@ class TestRwkv7Server(CustomTestCase):
 
         self.assertEqual(warm["meta_info"]["cached_tokens"], len(prefix_ids))
         self.assertEqual(warm["output_ids"], cold["output_ids"])
+
+    def test_mixed_length_dynamic_batch_compaction(self):
+        """Finishing short rows must not move a neighbor's recurrent state."""
+
+        prompt_a = [300 + i for i in range(64)]
+        prompt_b = [1300 + i for i in range(96)]
+        prompt_c = [2300 + i for i in range(128)]
+        work = [
+            (prompt_a, 16),
+            (prompt_b, 8),
+            (prompt_a, 64),
+            (prompt_c, 32),
+            (prompt_a, 64),
+        ]
+        barrier = threading.Barrier(len(work))
+
+        def generate(item):
+            input_ids, max_new_tokens = item
+            barrier.wait(timeout=10)
+            return self._generate_ids(input_ids, max_new_tokens)["output_ids"]
+
+        self._flush_cache()
+        with ThreadPoolExecutor(max_workers=len(work)) as executor:
+            outputs = list(executor.map(generate, work))
+
+        self.assertEqual([len(output) for output in outputs], [16, 8, 64, 32, 64])
+        self.assertEqual(
+            outputs[0],
+            outputs[2][:16],
+            "the duplicate prompt diverged before its short request completed",
+        )
+        self.assertEqual(
+            outputs[2],
+            outputs[4],
+            "surviving duplicate requests diverged while the batch compacted",
+        )
+
+        # Once the other three rows have finished and the running batch has
+        # compacted, the surviving row must still agree with a clean request.
+        self._flush_cache()
+        clean = self._generate_ids(prompt_a, 64)["output_ids"]
+        self.assertEqual(
+            outputs[2][:4],
+            clean[:4],
+            "mixed-length batch compaction corrupted the surviving RWKV state",
+        )
+
+    def test_abort_releases_recurrent_state(self):
+        """An aborted request must not leak state into the next pool occupant."""
+
+        reference_ids = [100 + i for i in range(32)]
+        self._flush_cache()
+        reference = self._generate_ids(reference_ids, 1)["output_ids"]
+        # Remove the reference prefix from radix cache. The post-abort request
+        # must start from a newly initialized state rather than a cache hit.
+        self._flush_cache()
+
+        rid = f"rwkv7-abort-{uuid.uuid4().hex}"
+        result: dict[str, Any] = {}
+
+        def run_long_request():
+            try:
+                response = requests.post(
+                    f"{self.base_url}/generate",
+                    json={
+                        "rid": rid,
+                        "input_ids": [4300 + (i % 2048) for i in range(2048)],
+                        "sampling_params": {
+                            "temperature": 0.0,
+                            "max_new_tokens": 4096,
+                            "ignore_eos": True,
+                        },
+                    },
+                    timeout=120,
+                )
+                result["status_code"] = response.status_code
+                try:
+                    result["body"] = response.json()
+                except ValueError:
+                    result["body"] = response.text
+            except requests.RequestException as exc:
+                result["exception"] = repr(exc)
+
+        thread = threading.Thread(target=run_long_request)
+        thread.start()
+        time.sleep(0.5)
+        deadline = time.monotonic() + 8
+        while thread.is_alive() and time.monotonic() < deadline:
+            response = requests.post(
+                f"{self.base_url}/abort_request",
+                json={"rid": rid, "abort_all": False},
+                timeout=10,
+            )
+            response.raise_for_status()
+            time.sleep(0.2)
+
+        thread.join(timeout=30)
+        self.assertFalse(thread.is_alive(), "aborted RWKV request did not terminate")
+        self.assertNotIn("exception", result, result.get("exception"))
+        self.assertEqual(result.get("status_code"), 200, result)
+        body = result.get("body")
+        if isinstance(body, list):
+            body = body[0]
+        finish_reason = (
+            body.get("meta_info", {}).get("finish_reason", {})
+            if isinstance(body, dict)
+            else {}
+        )
+        self.assertEqual(finish_reason.get("type"), "abort", result)
+
+        after_abort = self._generate_ids(reference_ids, 1)
+        self.assertEqual(after_abort["meta_info"]["cached_tokens"], 0)
+        self.assertEqual(
+            after_abort["output_ids"],
+            reference,
+            "the request after abort inherited stale recurrent state",
+        )
 
 
 if __name__ == "__main__":

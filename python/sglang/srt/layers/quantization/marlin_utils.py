@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import numpy
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
@@ -915,22 +916,33 @@ class MarlinLinearMethod(LinearMethodBase):
         size_k = x_2d.shape[1]
         size_n = scales.shape[1]
 
-        output_2d = gptq_marlin_gemm(
-            x_2d,
-            None,
-            qweight,
-            scales,
-            None,
-            None,
-            None,
-            None,
-            workspace,
-            scalar_types.uint4b8,
-            size_m=size_m,
-            size_n=size_n,
-            size_k=size_k,
-            use_fp32_reduce=False,
-        )
+        # Some recurrent models need batch-layout-invariant projection results:
+        # a one-ULP row-order change can accumulate through state and eventually
+        # change greedy output.  Such a model may attach a non-persistent dense
+        # fallback for small token batches while retaining packed Marlin weights
+        # for throughput-oriented prefill.  The hook is opt-in and therefore has
+        # no memory or dispatch cost for ordinary Marlin layers.
+        dense_fallback = getattr(layer, "_rwkv7_decode_weight", None)
+        fallback_max_tokens = getattr(layer, "_rwkv7_marlin_fallback_max_tokens", 0)
+        if dense_fallback is not None and size_m <= fallback_max_tokens:
+            output_2d = F.linear(x_2d, dense_fallback)
+        else:
+            output_2d = gptq_marlin_gemm(
+                x_2d,
+                None,
+                qweight,
+                scales,
+                None,
+                None,
+                None,
+                None,
+                workspace,
+                scalar_types.uint4b8,
+                size_m=size_m,
+                size_n=size_n,
+                size_k=size_k,
+                use_fp32_reduce=False,
+            )
 
         output = output_2d.view(x.shape[:-1] + (output_2d.shape[1],))
 
