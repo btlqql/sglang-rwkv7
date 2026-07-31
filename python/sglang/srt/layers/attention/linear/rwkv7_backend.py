@@ -103,6 +103,11 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
     """
 
     supports_draft_extend_v2 = True
+    # DRAFT_EXTEND_V2 has a fixed request width for the topk=1 RWKV chain and
+    # all recurrent metadata is refreshed through graph-stable buffers. Opt in
+    # explicitly so the speculative worker captures this otherwise launch-bound
+    # pass instead of replaying hundreds of eager kernels per verify cycle.
+    supports_speculative_draft_extend_cuda_graph = True
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
@@ -130,6 +135,9 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
         # same addresses, so one max-bs allocation is sufficient for all graphs.
         self.prefill_query_start_loc: Optional[torch.Tensor] = None
         self.prefill_state_indices: Optional[torch.Tensor] = None
+        self.draft_extend_query_start_loc: Optional[torch.Tensor] = None
+        self.draft_extend_state_indices: Optional[torch.Tensor] = None
+        self.draft_extend_width: Optional[int] = None
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         super().init_cuda_graph_state(max_bs, max_num_tokens)
@@ -158,6 +166,34 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
             (capacity,), self.pad_slot_id, dtype=torch.int32, device=self.device
         )
 
+    def _ensure_draft_extend_cuda_graph_state(self, min_bs: int, width: int):
+        if self.draft_extend_state_indices is not None:
+            if min_bs > self.draft_extend_state_indices.numel():
+                raise RuntimeError(
+                    "RWKV-7 draft-extend CUDA-graph request capacity cannot grow "
+                    f"after capture: requested {min_bs}, allocated "
+                    f"{self.draft_extend_state_indices.numel()}."
+                )
+            if width != self.draft_extend_width:
+                raise RuntimeError(
+                    "RWKV-7 draft-extend CUDA-graph width changed after capture: "
+                    f"requested {width}, captured {self.draft_extend_width}."
+                )
+            return
+
+        capacity = max(min_bs, self.req_to_token_pool.size)
+        self.draft_extend_width = width
+        self.draft_extend_query_start_loc = torch.arange(
+            0,
+            (capacity + 1) * width,
+            step=width,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.draft_extend_state_indices = torch.full(
+            (capacity,), self.pad_slot_id, dtype=torch.int32, device=self.device
+        )
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -172,6 +208,24 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
         explicitly while retaining the shared implementation for decode and
         speculative verify.
         """
+        if forward_batch.forward_mode.is_draft_extend_v2():
+            bs = forward_batch.batch_size
+            width = forward_batch.spec_info.num_tokens_per_req
+            self._ensure_draft_extend_cuda_graph_state(bs, width)
+            state_indices = self.draft_extend_state_indices[:bs]
+            state_indices.copy_(
+                self._translate_mamba_indices(
+                    self.req_to_token_pool.get_mamba_indices(
+                        forward_batch.req_pool_indices[:bs]
+                    )
+                )
+            )
+            self.forward_metadata = ForwardMetadata(
+                query_start_loc=self.draft_extend_query_start_loc[: bs + 1],
+                mamba_cache_indices=state_indices,
+            )
+            return
+
         if not (
             forward_batch.forward_mode.is_extend(include_draft_extend_v2=False)
             and not forward_batch.forward_mode.is_target_verify()

@@ -829,8 +829,8 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 class HybridLinearAttnBackend(AttentionBackend):
     """Manages a full and linear attention backend"""
 
-    # Draft-extend graph runners currently plan only native full-attention
-    # backends. Recurrent DRAFT_EXTEND_V2 uses eager packed-varlen metadata.
+    # Recurrent DRAFT_EXTEND_V2 stays eager unless an all-linear backend opts
+    # into the graph-stable fixed-width contract below.
     supports_speculative_draft_extend_cuda_graph = False
 
     def __init__(
@@ -843,6 +843,14 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_backend = full_attn_backend
         self.linear_attn_backend = linear_attn_backend
         self.attn_backend_list = [full_attn_backend, linear_attn_backend]
+        self.supports_speculative_draft_extend_cuda_graph = bool(
+            not full_attn_layers
+            and getattr(
+                linear_attn_backend,
+                "supports_speculative_draft_extend_cuda_graph",
+                False,
+            )
+        )
         self.token_to_kv_pool = full_attn_backend.token_to_kv_pool
         self.req_to_token_pool = full_attn_backend.req_to_token_pool
         self.max_context_len = getattr(full_attn_backend, "max_context_len", None)

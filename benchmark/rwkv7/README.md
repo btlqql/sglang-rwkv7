@@ -346,12 +346,37 @@ python -m sglang.launch_server \
   --model-path /path/to/rwkv7-target \
   --trust-remote-code \
   --attention-backend triton \
+  --max-running-requests 8 \
+  --max-mamba-cache-size 24 \
+  --cuda-graph-max-bs-decode 8 \
   --speculative-algorithm STANDALONE \
   --speculative-draft-model-path /path/to/rwkv7-draft \
   --speculative-num-steps 3 \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4 \
   --disable-overlap-schedule
+```
+
+RWKV-7 currently reserves three recurrent state paths per running speculative
+request. Consequently, a true batch size of eight requires
+`--max-mamba-cache-size 24`; setting it to 16 caps the effective running batch
+at five even when `--max-running-requests 8` is present.
+
+Use the paired serving harness to measure baseline and speculative endpoints
+with identical fixed-batch inputs. It requires exact greedy token IDs and
+records TTFT, prefill/decode/end-to-end throughput, draft acceptance counters,
+and the server-wide average accept length:
+
+```bash
+python benchmark/rwkv7/bench_speculative.py \
+  --baseline-url http://127.0.0.1:30001 \
+  --spec-url http://127.0.0.1:30000 \
+  --batch-sizes 8 \
+  --prompt-lengths 128,512,2048 \
+  --decode-lengths 128,512 \
+  --target-model rwkv7-g1g-1.5b \
+  --draft-model rwkv7-g1d-0.4b \
+  --output rwkv7-speculative.jsonl
 ```
 
 The end-to-end gate is
@@ -369,7 +394,9 @@ Hardware validation snapshots:
 | RTX 4080 | RWKV-7 1.5B, FP16 | 1 | 128-token cache hit + 16-token decode | cold/warm exact |
 | V100 | RWKV-7 0.1B, FP16 | 1, 2 | 32 tokens | exact vs. non-speculative |
 
-For decode CUDA Graphs, target verify and multi-step draft decode are captured;
-RWKV draft extend currently remains eager. On legacy CUDA systems without a
-compatible `sgl_kernel`, speculative tree construction and greedy verification
-fall back to the in-tree Triton kernels.
+For decode CUDA Graphs, target verify, multi-step draft decode, and the fixed
+width RWKV draft-extend pass are captured. Draft extend uses graph-stable
+request-to-state indices and query offsets; other linear or hybrid architectures
+remain eager unless their backend explicitly declares the same contract. On
+legacy CUDA systems without a compatible `sgl_kernel`, speculative tree
+construction and greedy verification fall back to the in-tree Triton kernels.
