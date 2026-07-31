@@ -17,10 +17,10 @@ def rwkv7_w4_int8_shadow_gemm(
     """Apply the per-channel INT8 shadow with fixed-shape fused accumulation.
 
     ``group_size`` is accepted to keep the Marlin dispatch hook uniform; the
-    shadow intentionally uses one W8 scale per output channel. Decode-sized
-    inputs use a fixed 32-row fused INT8 kernel. Larger short prefills
-    reconstruct the dense quantized weight for chunk-boundary-stable GEMM
-    without retaining an FP16 copy in model memory.
+    shadow intentionally uses one W8 scale per output channel. Small inputs
+    are padded to a whole-warp row bucket and use the same fused INT8 kernel
+    for decode and eager prefill. Integer accumulation keeps each projection
+    row independent of batch layout and chunk boundaries.
     """
     del group_size
     if x.ndim != 2 or qweight.ndim != 2 or scales.ndim != 2:
@@ -36,10 +36,6 @@ def rwkv7_w4_int8_shadow_gemm(
         )
     if qweight.dtype != torch.int8:
         raise TypeError(f"W4 shadow weight must be int8, got {qweight.dtype}")
-
-    if rows > 8:
-        dense_weight = (qweight.float() * scales).to(dtype=x.dtype)
-        return torch.nn.functional.linear(x, dense_weight)
 
     x_quantized, x_scale = per_token_quant_int8(x)
     padded_rows = max(32, ((rows + 31) // 32) * 32)

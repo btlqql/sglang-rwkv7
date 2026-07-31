@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -70,6 +71,12 @@ class TestRwkv7OnlineMarlin(unittest.TestCase):
         size_k, size_n = 256, 256
         group_size = 128
         weight = torch.randn(size_n, size_k, device="cuda", dtype=torch.float16) / 20
+        marlin_reference = marlin_quantize(
+            weight.t().contiguous(),
+            scalar_types.uint4b8,
+            group_size,
+            False,
+        )
         packed_weight, scales, shadow, shadow_scales = (
             online_marlin_quantize_weight_with_int8_shadow(weight, group_size)
         )
@@ -105,6 +112,28 @@ class TestRwkv7OnlineMarlin(unittest.TestCase):
         ).to(prefill.dtype)
         torch.testing.assert_close(
             method.apply(layer, prefill), prefill_expected, rtol=0.03, atol=0.03
+        )
+        chunked_prefill = (
+            torch.randn(65, size_k, device="cuda", dtype=torch.float16) / 10
+        )
+        whole_prefill = method.apply(layer, chunked_prefill)
+        split_prefill = torch.cat(
+            (
+                method.apply(layer, chunked_prefill[:17]),
+                method.apply(layer, chunked_prefill[17:]),
+            )
+        )
+        torch.testing.assert_close(split_prefill, whole_prefill, rtol=0, atol=0)
+        with patch(
+            "sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager.get_tc_piecewise_forward_context",
+            return_value=SimpleNamespace(full_graph=True),
+        ):
+            captured = method.apply(layer, prefill)
+        torch.testing.assert_close(
+            captured,
+            prefill @ marlin_reference[0],
+            rtol=0.03,
+            atol=0.03,
         )
 
 
