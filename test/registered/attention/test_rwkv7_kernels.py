@@ -677,6 +677,31 @@ class TestRwkv7Kernels(unittest.TestCase):
         attention.k_proj.weight.data.fill_(3)
         self.assertEqual(float(stacked[1, 0, 0]), 3.0)
 
+    def test_rkv_stacked_projection_matches_canonical_linears(self):
+        config = Rwkv7Config(
+            hidden_size=2048,
+            num_hidden_layers=2,
+            head_dim=64,
+            num_heads=32,
+            intermediate_size=4096,
+        )
+        with torch.device("cuda"):
+            attention = Rwkv7Attention(config, layer_id=0)
+        attention = attention.to(dtype=torch.float16)
+
+        stacked = attention._rkv_stacked_weight
+        self.assertIsNotNone(stacked)
+        modules = (attention.r_proj, attention.k_proj, attention.v_proj)
+        for tokens in (8, 256):
+            mixed = torch.randn(
+                3, tokens, config.hidden_size, device="cuda", dtype=torch.float16
+            )
+            actual = torch.bmm(mixed, stacked.transpose(1, 2))
+            expected = torch.stack(
+                [module(mixed[index])[0] for index, module in enumerate(modules)]
+            )
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
 
 if __name__ == "__main__":
     unittest.main()

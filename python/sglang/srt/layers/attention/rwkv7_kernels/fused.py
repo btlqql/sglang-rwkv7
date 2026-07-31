@@ -170,6 +170,7 @@ def fused_kk_kmix(k, a, kk_param, ka_param, num_heads):
         H,
         num_heads,
         BK=BK,
+        num_warps=1,
         enable_fp_fusion=False,
     )
     return kk_out.view(T, num_heads, HD), knew_out
@@ -345,7 +346,7 @@ def fused_groupnorm_gate_corr(
         num_heads,
         EPS=float(eps),
         BK=BK,
-        num_warps=1 if T <= 8 else 2,
+        num_warps=1,
         enable_fp_fusion=False,
     )
     return out
