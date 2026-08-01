@@ -650,6 +650,53 @@ class TestRwkv7Kernels(unittest.TestCase):
             conv1[indices.long(), :, 0], normalized.float(), rtol=2e-2, atol=2e-2
         )
 
+        # The decode residual-carry path folds the activation-dtype residual
+        # addition into the next LayerNorm/token-shift launch and materializes
+        # the summed residual stream in the original x allocation.
+        residual = torch.randn_like(x)
+        residual_base = x + residual
+        residual_normalized = F.layer_norm(residual_base, (hidden,), weight, bias, 1e-5)
+        residual_delta = shifted - residual_normalized
+
+        x6 = x.clone()
+        conv6 = conv.clone()
+        actual6, actual_base6 = layernorm_token_shift_lerp6_decode(
+            x6,
+            conv6,
+            mix6,
+            weight,
+            bias,
+            1e-5,
+            indices,
+            residual=residual,
+            return_residual_base=True,
+        )
+        expected6 = torch.stack(
+            [residual_normalized + mix6[i] * residual_delta for i in range(6)],
+            dim=0,
+        )
+        self.assertEqual(actual_base6.data_ptr(), x6.data_ptr())
+        torch.testing.assert_close(actual_base6, residual_base, rtol=0, atol=0)
+        torch.testing.assert_close(actual6, expected6, rtol=2e-2, atol=2e-2)
+
+        x1 = x.clone()
+        conv1 = conv.clone()
+        actual1, actual_base1 = layernorm_token_shift_lerp1_decode(
+            x1,
+            conv1,
+            mix1,
+            weight,
+            bias,
+            1e-5,
+            indices,
+            residual=residual,
+            return_residual_base=True,
+        )
+        expected1 = residual_normalized + mix1 * residual_delta
+        self.assertEqual(actual_base1.data_ptr(), x1.data_ptr())
+        torch.testing.assert_close(actual_base1, residual_base, rtol=0, atol=0)
+        torch.testing.assert_close(actual1, expected1, rtol=2e-2, atol=2e-2)
+
     def test_rkv_stacked_storage_survives_dtype_apply(self):
         config = Rwkv7Config(
             hidden_size=2048,

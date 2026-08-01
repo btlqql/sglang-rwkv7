@@ -593,10 +593,11 @@ class Rwkv7Attention(nn.Module):
         x: torch.Tensor,
         v_first: Optional[torch.Tensor],
         norm: Optional[nn.LayerNorm] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        residual: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         T = x.shape[0]
         if T == 0:
-            return x, v_first
+            return x, v_first, x
 
         be = _linear_backend(forward_batch)
         # Local (per-rank) head slice; == the full width at tp=1.
@@ -608,7 +609,7 @@ class Rwkv7Attention(nn.Module):
         fused = x.dtype != torch.float32
 
         if fused:
-            lp = be.token_shift_lerp6(
+            lp, x = be.token_shift_lerp6(
                 x,
                 self._mix6_buf(),
                 self.layer_id,
@@ -617,9 +618,13 @@ class Rwkv7Attention(nn.Module):
                 norm_weight=None if norm is None else norm.weight,
                 norm_bias=None if norm is None else norm.bias,
                 norm_eps=1e-5 if norm is None else norm.eps,
+                residual=residual,
             )
             xr, xk, xv, xw, xa, xg = lp[0], lp[1], lp[2], lp[3], lp[4], lp[5]
         else:
+            if residual is not None:
+                x = x + residual
+            residual_base = x
             if norm is not None:
                 x = norm(x)
             shifted = be.token_shift(x, self.layer_id, 0, forward_batch)
@@ -723,7 +728,7 @@ class Rwkv7Attention(nn.Module):
             o = o + gate_corr
             o = o * g
         out = self.o_proj(o)[0]
-        return out, v_first
+        return out, v_first, x if fused else residual_base
 
 
 class Rwkv7FeedForward(nn.Module):
@@ -860,11 +865,12 @@ class Rwkv7FeedForward(nn.Module):
         forward_batch: ForwardBatch,
         x: torch.Tensor,
         norm: Optional[nn.LayerNorm] = None,
-    ) -> torch.Tensor:
+        residual: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if x.shape[0] == 0:
-            return x
+            return x, x
         be = _linear_backend(forward_batch)
-        xk = be.token_shift_lerp1(
+        xk, x = be.token_shift_lerp1(
             x,
             self.x_k,
             self.layer_id,
@@ -873,6 +879,7 @@ class Rwkv7FeedForward(nn.Module):
             norm_weight=None if norm is None else norm.weight,
             norm_bias=None if norm is None else norm.bias,
             norm_eps=1e-5 if norm is None else norm.eps,
+            residual=residual,
         )
         k = self.key(xk)[0]
         value_weight_t = self._value_transposed_weight
@@ -887,7 +894,7 @@ class Rwkv7FeedForward(nn.Module):
         else:
             act = self.activation(k)
             out = self.value(act)[0]
-        return out
+        return out, x
 
 
 class Rwkv7DecoderLayer(nn.Module):
@@ -926,11 +933,22 @@ class Rwkv7DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         x: torch.Tensor,
         v_first: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        attn_out, v_first = self.attn(forward_batch, x, v_first, norm=self.attn_norm)
-        x = x + attn_out
-        x = x + self.ffn(forward_batch, x, norm=self.ffn_norm)
-        return x, v_first
+        residual: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        attn_out, v_first, x = self.attn(
+            forward_batch,
+            x,
+            v_first,
+            norm=self.attn_norm,
+            residual=residual,
+        )
+        ffn_out, x = self.ffn(
+            forward_batch,
+            x,
+            norm=self.ffn_norm,
+            residual=attn_out,
+        )
+        return x, ffn_out, v_first
 
 
 class Rwkv7Model(nn.Module):
@@ -1003,8 +1021,13 @@ class Rwkv7Model(nn.Module):
                 r = _tp_rank()
                 v_first = v_first[:, r * Hl : (r + 1) * Hl].contiguous()
 
+        residual = None
         for i in range(self.start_layer, self.end_layer):
-            x, v_first = self.layers[i](forward_batch, x, v_first)
+            x, residual, v_first = self.layers[i](
+                forward_batch, x, v_first, residual=residual
+            )
+        if residual is not None:
+            x = x + residual
 
         if not self.pp_group.is_last_rank:
             # v_first (layer 0's value projection — under tp>1 the LOCAL head
