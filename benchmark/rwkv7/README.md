@@ -131,7 +131,7 @@ The default is `accuracy`; the alternatives are explicit trade-offs:
 
 ```text
 SGLANG_RWKV7_W8_POLICY=accuracy|balanced|speed
-SGLANG_RWKV7_W4_POLICY=accuracy|balanced|speed
+SGLANG_RWKV7_W4_POLICY=accuracy|balanced|speed|sparse
 ```
 
 Low-rank controls and lm_head stay dense for these paths. The recurrent WKV
@@ -186,6 +186,15 @@ memory/decode benefit without the large-batch pure-Marlin prefill regression.
 online Marlin setting in the validated environment. The two cutoffs can be
 overridden with `SGLANG_RWKV7_MARLIN_FALLBACK_MAX_TOKENS` and
 `SGLANG_RWKV7_INT8_EXACT_MAX_TOKENS` after repeating the correctness gate.
+
+The `sparse` policy is a decode-throughput lane rather than the maximum-
+compression lane. It keeps recurrent attention and FFN contraction weights
+dense, preserving the zero-skipping SqReLU contraction kernel, and applies W4
+only to a calibrated subset of interior FFN expansion layers. Edge layers and
+the later secondary lane remain dense for accuracy. Use this policy only after
+running both `verify_serving_features.py` and `verify_quant_alignment.py` on
+the target checkpoint; the selected layers scale with model depth, so evidence
+from one size is not evidence for every size.
 
 ## Quantized alignment
 

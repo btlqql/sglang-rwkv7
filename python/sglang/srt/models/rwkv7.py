@@ -9,11 +9,12 @@ The WKV recurrence runs in a dedicated backend kernel. Module and parameter
 names mirror the fla-format checkpoint, so ``load_weights`` needs no remapping.
 
 Quantization: the large r/k/v/o_proj and FFN key/value projections are SGLang
-quant-aware linears. RWKV-specific accuracy/balanced/speed policies choose
-which of those projections are quantized. Online W8/W4 and BitsAndBytes keep
-low-rank controls and lm_head dense because their small or poorly shaped GEMMs
-add error/latency for little memory benefit. The WKV recurrence/state and
-per-channel parameters (x_*, k_k, k_a, r_k, g_norm) are never weight-quantized.
+quant-aware linears. RWKV-specific policies, including a W4 lane that preserves
+the sparse-FFN kernel, choose which projections are quantized. Online W8/W4 and
+BitsAndBytes keep low-rank controls and lm_head dense because their small or
+poorly shaped GEMMs add error/latency for little memory benefit. The WKV
+recurrence/state and per-channel parameters (x_*, k_k, k_a, r_k, g_norm) are
+never weight-quantized.
 
 Tensor parallelism is head-parallel: head_dim stays whole and whole heads are
 split across ranks (r/k/v + LoRA-up column-parallel with no gather, per-channel
@@ -147,9 +148,9 @@ def _rwkv7_w8_policy() -> str:
 def _rwkv7_w4_policy() -> str:
     """Select the model-specific online Marlin accuracy/compression trade-off."""
     policy = os.getenv("SGLANG_RWKV7_W4_POLICY", "accuracy").lower()
-    if policy not in ("accuracy", "balanced", "speed"):
+    if policy not in ("accuracy", "balanced", "speed", "sparse"):
         raise ValueError(
-            "SGLANG_RWKV7_W4_POLICY must be accuracy, balanced, or speed; "
+            "SGLANG_RWKV7_W4_POLICY must be accuracy, balanced, speed, or sparse; "
             f"got {policy!r}."
         )
     return policy
@@ -226,13 +227,16 @@ def _rwkv7_projection_quant_config(
     """Apply RWKV-specific mixed-precision policy to large projections.
 
     ``projection`` is one of ``attention``, ``ffn_key``, or ``ffn_value``.
-    The speed policies quantize every large projection. Balanced policies keep
-    recurrent attention dense. Accuracy policies additionally protect the W8
-    sqReLU expansion and the most sensitive edge FFN layers. The W4 accuracy
-    lane uses W4 only for alternating middle FFN expansion projections. The
-    contraction projection stays W8: repeated-request testing found that its
-    small-M Marlin reduction can flip near-tied greedy logits, while W4 on the
-    expansion remains deterministic and retains a real W4 memory/speed lane.
+    The speed policies quantize every large projection. The W4 sparse policy
+    keeps recurrent attention and the FFN contraction dense so the zero-skipping
+    SqReLU decode kernel can be used while a conservative subset of middle FFN
+    expansion weights remains quantized. Balanced policies keep recurrent
+    attention dense. Accuracy policies additionally protect the W8 sqReLU
+    expansion and the most sensitive edge FFN layers. The W4 accuracy lane uses
+    W4 only for alternating middle FFN expansion projections. The contraction
+    projection stays W8: repeated-request testing found that its small-M Marlin
+    reduction can flip near-tied greedy logits, while W4 on the expansion
+    remains deterministic and retains a real W4 memory/speed lane.
     """
     if quant_config is None:
         return None
@@ -256,6 +260,23 @@ def _rwkv7_projection_quant_config(
 
     if name == "marlin":
         policy = _rwkv7_w4_policy()
+        if policy == "sparse":
+            if projection != "ffn_key":
+                return None
+            if layer_id is None or num_hidden_layers is None:
+                raise ValueError("W4 sparse policy requires layer metadata")
+            edge_layers = min(4, max(1, num_hidden_layers // 6))
+            interior_offset = layer_id - edge_layers
+            primary_lane = interior_offset % 4 == 0
+            early_secondary_lane = (
+                interior_offset % 4 == 2 and layer_id < num_hidden_layers // 2
+            )
+            if not (
+                edge_layers <= layer_id < num_hidden_layers - edge_layers
+                and (primary_lane or early_secondary_lane)
+            ):
+                return None
+            return quant_config
         if policy == "speed":
             return quant_config
         if projection == "attention":

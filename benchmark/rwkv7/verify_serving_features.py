@@ -112,6 +112,13 @@ def equal_ids(left, right, prefix_tokens: int = 0):
     return left == right
 
 
+def matching_prefix_length(left, right) -> int:
+    for index, (left_id, right_id) in enumerate(zip(left, right)):
+        if left_id != right_id:
+            return index
+    return min(len(left), len(right))
+
+
 def decode_response(response: requests.Response) -> Any:
     try:
         return response.json()
@@ -285,9 +292,13 @@ def main():
         warm["meta_info"]["cached_tokens"] == len(prefix_ids),
         "state cache did not restore the complete prefix",
     )
+    cache_matching_prefix = matching_prefix_length(
+        cold["output_ids"], warm["output_ids"]
+    )
     require(
         cold["output_ids"] == warm["output_ids"],
-        "cached continuation differs from cold chunked prefill",
+        "cached continuation differs from cold chunked prefill "
+        f"after {cache_matching_prefix} matching tokens",
     )
 
     lifecycle = {} if args.skip_lifecycle else verify_lifecycle(client, repeat_tokens)
@@ -302,6 +313,7 @@ def main():
         "single_batch_prefix_tokens": prefix_tokens,
         "single_batch_prefix_match": single_batch_prefix_match,
         "chunked_prefill_cold_warm_match": True,
+        "chunked_prefill_cold_warm_matching_prefix": cache_matching_prefix,
         "state_cache_hit_tokens": warm["meta_info"]["cached_tokens"],
         "reference_match": args.reference_output is not None,
         "reference_output_ids": deterministic_ids,

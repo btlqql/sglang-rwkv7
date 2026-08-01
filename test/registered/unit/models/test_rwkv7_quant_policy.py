@@ -107,6 +107,21 @@ class TestRwkv7QuantPolicy(unittest.TestCase):
                         quant,
                     )
 
+    def test_w4_sparse_policy_quantizes_selected_ffn_expansions_only(self):
+        quant = FakeQuantConfig("marlin")
+        with patch.dict(os.environ, {"SGLANG_RWKV7_W4_POLICY": "sparse"}):
+            self.assertIsNone(_rwkv7_projection_quant_config(quant, "attention", 0, 24))
+            for layer_id in (4, 6, 8, 10, 12, 16):
+                self.assertIs(
+                    _rwkv7_projection_quant_config(quant, "ffn_key", layer_id, 24),
+                    quant,
+                )
+            for layer_id in (0, 5, 14, 18, 23):
+                self.assertIsNone(
+                    _rwkv7_projection_quant_config(quant, "ffn_key", layer_id, 24)
+                )
+            self.assertIsNone(_rwkv7_projection_quant_config(quant, "ffn_value", 0, 24))
+
     def test_unrecognized_quantizer_uses_the_generic_policy(self):
         quant = FakeQuantConfig("bitsandbytes")
         for projection in ("attention", "ffn_key", "ffn_value"):
