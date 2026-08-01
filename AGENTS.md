@@ -76,3 +76,17 @@ explicit deliverables; they may not be silently removed from the overall goal.
 - Use focused commits with tests and reproducible commands.
 - Do not commit credentials, local paths, private machine addresses, or raw
   checkpoint files.
+
+## GitHub identity isolation
+
+- Run `scripts/install_git_identity_hooks.sh` once in every clone. It binds the
+  repository-local Git author and committer to the active `gh` account and
+  enables the versioned hooks in `.githooks/`.
+- The pre-commit hook requires the author name, committer name, and verified or
+  canonical GitHub noreply email to match the active GitHub account.
+- The pre-push hook checks only commits newly introduced relative to the remote,
+  so upstream history is not rejected. It requires the branch prefix to match
+  the active account, blocks direct pushes to `main`, and blocks updates to an
+  open PR created by another account.
+- Switch accounts with `gh auth switch -h github.com -u <login>`, then rerun the
+  installer before working on that account's branch or PR.
