@@ -74,6 +74,7 @@ from sglang.srt.layers.attention.rwkv7_kernels.fused import (
     fused_lowrank_controls,
     is_profitable_fused_lowrank_shape,
 )
+from sglang.srt.layers.attention.rwkv7_kernels.token_shift import layernorm_residual
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -1026,7 +1027,21 @@ class Rwkv7Model(nn.Module):
             x, residual, v_first = self.layers[i](
                 forward_batch, x, v_first, residual=residual
             )
-        if residual is not None:
+        final_norm_fused = bool(
+            residual is not None
+            and self.pp_group.is_last_rank
+            and x.dtype in (torch.float16, torch.bfloat16)
+            and forward_batch.forward_mode.is_decode_or_idle()
+        )
+        if final_norm_fused:
+            x = layernorm_residual(
+                x,
+                residual,
+                self.norm.weight,
+                self.norm.bias,
+                self.norm.eps,
+            )
+        elif residual is not None:
             x = x + residual
 
         if not self.pp_group.is_last_rank:
@@ -1052,7 +1067,8 @@ class Rwkv7Model(nn.Module):
                 v_first = tensor_model_parallel_all_gather(v_first.contiguous())
             return PPProxyTensors({"hidden_states": x, "v_first": v_first})
 
-        x = self.norm(x)
+        if not final_norm_fused:
+            x = self.norm(x)
         return x
 
 
