@@ -46,6 +46,7 @@ def test_rejects_an_unverified_email():
     ("url", "expected"),
     [
         ("https://github.com/acme/project.git", ("acme", "project")),
+        ("https://alice@github.com/acme/project.git", ("acme", "project")),
         ("git@github.com:acme/project.git", ("acme", "project")),
         ("ssh://git@github.com/acme/project", ("acme", "project")),
         ("ssh://host/path/project", None),

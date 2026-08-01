@@ -16,7 +16,7 @@ from urllib.parse import quote
 ZERO_OID_RE = re.compile(r"^0+$")
 IDENT_RE = re.compile(r"^(.*?) <([^<>]+)> \d+ [+-]\d{4}$")
 GITHUB_REMOTE_RE = re.compile(
-    r"^(?:https://github\.com/|ssh://git@github\.com/|git@github\.com:)([^/]+)/([^/]+?)(?:\.git)?$"
+    r"^(?:https://(?:[^/@]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)([^/]+)/([^/]+?)(?:\.git)?$"
 )
 
 
