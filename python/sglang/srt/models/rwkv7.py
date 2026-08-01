@@ -62,17 +62,17 @@ from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.layers.activation import ReLU2
+from sglang.srt.layers.attention.rwkv7_kernels.ffn_sparse_cuda import (
+    can_use_sparse_sqrelu_down,
+    sparse_ffn_enabled,
+    sparse_sqrelu_down,
+)
 from sglang.srt.layers.attention.rwkv7_kernels.fused import (
     can_fuse_lowrank_controls,
     fused_groupnorm_gate_corr,
     fused_kk_kmix,
     fused_lowrank_controls,
     is_profitable_fused_lowrank_shape,
-)
-from sglang.srt.layers.attention.rwkv7_kernels.ffn_sparse_cuda import (
-    can_use_sparse_sqrelu_down,
-    sparse_ffn_enabled,
-    sparse_sqrelu_down,
 )
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,

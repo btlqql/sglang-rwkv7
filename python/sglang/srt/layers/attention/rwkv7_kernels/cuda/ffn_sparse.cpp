@@ -4,7 +4,7 @@
 #include <torch/extension.h>
 
 torch::Tensor rwkv7_sparse_sqrelu_down_cuda(torch::Tensor preact,
-                                             torch::Tensor value_weight_t);
+                                            torch::Tensor value_weight_t);
 
 TORCH_LIBRARY(sglang_rwkv7_sparse_ffn, m) {
   m.def("sqrelu_down_fp16(Tensor preact, Tensor value_weight_t) -> Tensor");

@@ -1,9 +1,10 @@
 // Copyright 2025-2026 SGLang Team
 // Licensed under the Apache License, Version 2.0 (the "License");
 //
-// Small-row RWKV-7 FFNs are exactly sparse after SqReLU: negative preactivations
-// become zero. This kernel compacts each 128-wide activation tile and skips
-// the corresponding rows of the transposed down-projection weight.
+// Small-row RWKV-7 FFNs are exactly sparse after SqReLU: negative
+// preactivations become zero. This kernel compacts each 128-wide activation
+// tile and skips the corresponding rows of the transposed down-projection
+// weight.
 //
 // The dynamic zero-compaction strategy is informed by Albatross's Apache-2.0
 // cmix sparse-down kernels (commit
@@ -28,12 +29,9 @@ constexpr int kThreads = 128;
 constexpr int kFfnTile = 128;
 constexpr int kOutputTile = 2 * kThreads;
 
-__global__ __launch_bounds__(kThreads, 4)
-void rwkv7_sparse_sqrelu_down_kernel(
-    int hidden_size, int intermediate_size,
-    const half *__restrict__ preact,
-    const half *__restrict__ value_weight_t,
-    half *__restrict__ output) {
+__global__ __launch_bounds__(kThreads, 4) void rwkv7_sparse_sqrelu_down_kernel(
+    int hidden_size, int intermediate_size, const half *__restrict__ preact,
+    const half *__restrict__ value_weight_t, half *__restrict__ output) {
   __shared__ __align__(256) half activation[kFfnTile];
   __shared__ __align__(256) int nonzero_ids[kFfnTile];
   __shared__ int warp_counts[kFfnTile / 32];
@@ -49,9 +47,8 @@ void rwkv7_sparse_sqrelu_down_kernel(
   const int f_begin = f_tile * kFfnTile;
   const int output_begin = output_tile * kOutputTile;
 
-  const float x =
-      __half2float(preact[static_cast<int64_t>(row) * intermediate_size +
-                          f_begin + tid]);
+  const float x = __half2float(
+      preact[static_cast<int64_t>(row) * intermediate_size + f_begin + tid]);
   const float relu = fmaxf(x, 0.0f);
   activation[tid] = __float2half_rn(relu * relu);
   __syncthreads();
@@ -85,25 +82,21 @@ void rwkv7_sparse_sqrelu_down_kernel(
     const int local_f = nonzero_ids[i];
     const int f = f_begin + local_f;
     const half2 weight = *reinterpret_cast<const half2 *>(
-        value_weight_t + static_cast<int64_t>(f) * hidden_size +
-        output_begin + tid * 2);
+        value_weight_t + static_cast<int64_t>(f) * hidden_size + output_begin +
+        tid * 2);
     accumulator =
         __hfma2(__half2half2(activation[local_f]), weight, accumulator);
   }
 
-  atomicAdd(
-      reinterpret_cast<half2 *>(
-          output + static_cast<int64_t>(row) * hidden_size +
-          output_begin + tid * 2),
-      accumulator);
+  atomicAdd(reinterpret_cast<half2 *>(output +
+                                      static_cast<int64_t>(row) * hidden_size +
+                                      output_begin + tid * 2),
+            accumulator);
 }
 
-__global__ __launch_bounds__(256, 2)
-void rwkv7_sparse_sqrelu_down_t512_kernel(
-    int hidden_size, int intermediate_size,
-    const half *__restrict__ preact,
-    const half *__restrict__ value_weight_t,
-    half *__restrict__ output) {
+__global__ __launch_bounds__(256, 2) void rwkv7_sparse_sqrelu_down_t512_kernel(
+    int hidden_size, int intermediate_size, const half *__restrict__ preact,
+    const half *__restrict__ value_weight_t, half *__restrict__ output) {
   constexpr int kTile = 512;
   constexpr int kTileThreads = 256;
   __shared__ __align__(256) half activation[kTile];
@@ -171,23 +164,22 @@ void rwkv7_sparse_sqrelu_down_t512_kernel(
     const int local_f = nonzero_ids[i];
     const int f = f_begin + local_f;
     const half2 weight = *reinterpret_cast<const half2 *>(
-        value_weight_t + static_cast<int64_t>(f) * hidden_size +
-        output_begin + tid * 2);
+        value_weight_t + static_cast<int64_t>(f) * hidden_size + output_begin +
+        tid * 2);
     accumulator =
         __hfma2(__half2half2(activation[local_f]), weight, accumulator);
   }
 
-  atomicAdd(
-      reinterpret_cast<half2 *>(
-          output + static_cast<int64_t>(row) * hidden_size +
-          output_begin + tid * 2),
-      accumulator);
+  atomicAdd(reinterpret_cast<half2 *>(output +
+                                      static_cast<int64_t>(row) * hidden_size +
+                                      output_begin + tid * 2),
+            accumulator);
 }
 
-}  // namespace
+} // namespace
 
 torch::Tensor rwkv7_sparse_sqrelu_down_cuda(torch::Tensor preact,
-                                             torch::Tensor value_weight_t) {
+                                            torch::Tensor value_weight_t) {
   TORCH_CHECK(preact.is_cuda() && value_weight_t.is_cuda(),
               "preact and value_weight_t must be CUDA tensors");
   TORCH_CHECK(preact.scalar_type() == at::kHalf &&
@@ -214,8 +206,7 @@ torch::Tensor rwkv7_sparse_sqrelu_down_cuda(torch::Tensor preact,
   const c10::cuda::CUDAGuard device_guard(preact.device());
   auto output = at::zeros({rows, hidden_size}, preact.options());
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  if (rows >= 8 && intermediate_size % 512 == 0 &&
-      hidden_size % 512 == 0) {
+  if (rows >= 8 && intermediate_size % 512 == 0 && hidden_size % 512 == 0) {
     const dim3 grid(intermediate_size / 512, hidden_size / 512, rows);
     rwkv7_sparse_sqrelu_down_t512_kernel<<<grid, 256, 0, stream>>>(
         hidden_size, intermediate_size,
@@ -223,8 +214,8 @@ torch::Tensor rwkv7_sparse_sqrelu_down_cuda(torch::Tensor preact,
         reinterpret_cast<const half *>(value_weight_t.data_ptr<at::Half>()),
         reinterpret_cast<half *>(output.data_ptr<at::Half>()));
   } else {
-    const dim3 grid(intermediate_size / kFfnTile,
-                    hidden_size / kOutputTile, rows);
+    const dim3 grid(intermediate_size / kFfnTile, hidden_size / kOutputTile,
+                    rows);
     rwkv7_sparse_sqrelu_down_kernel<<<grid, kThreads, 0, stream>>>(
         hidden_size, intermediate_size,
         reinterpret_cast<const half *>(preact.data_ptr<at::Half>()),
