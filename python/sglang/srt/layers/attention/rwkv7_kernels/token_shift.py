@@ -18,6 +18,7 @@ import triton.language as tl
 @triton.jit
 def _layernorm_token_shift_lerp6_decode_kernel(
     x_ptr,
+    residual_ptr,
     conv_ptr,
     mix_ptr,
     weight_ptr,
@@ -30,6 +31,7 @@ def _layernorm_token_shift_lerp6_decode_kernel(
     conv_stride_h: tl.constexpr,
     EPS: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
     """Fuse decode LayerNorm, state shift/update and all six time mixes."""
@@ -37,7 +39,15 @@ def _layernorm_token_shift_lerp6_decode_kernel(
     hidden_offset = tl.arange(0, BLOCK_H)
     mask = hidden_offset < hidden_size
     row = request_index * hidden_size
+    DT = out_ptr.dtype.element_ty
     raw = tl.load(x_ptr + row + hidden_offset, mask=mask, other=0.0).to(tl.float32)
+    if HAS_RESIDUAL:
+        residual = tl.load(residual_ptr + row + hidden_offset, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        # Match torch's activation-dtype residual rounding before LayerNorm.
+        raw = (raw + residual).to(DT).to(tl.float32)
+        tl.store(x_ptr + row + hidden_offset, raw.to(DT), mask=mask)
     mean = tl.sum(tl.where(mask, raw, 0.0), axis=0) / hidden_size
     centered = tl.where(mask, raw - mean, 0.0)
     variance = tl.sum(centered * centered, axis=0) / hidden_size
@@ -46,7 +56,6 @@ def _layernorm_token_shift_lerp6_decode_kernel(
         bias = tl.load(bias_ptr + hidden_offset, mask=mask, other=0.0).to(tl.float32)
     else:
         bias = 0.0
-    DT = out_ptr.dtype.element_ty
     normalized = (centered * tl.rsqrt(variance + EPS) * weight + bias).to(DT)
     normalized_fp32 = normalized.to(tl.float32)
 
@@ -84,6 +93,7 @@ def _layernorm_token_shift_lerp6_decode_kernel(
 @triton.jit
 def _layernorm_token_shift_lerp1_decode_kernel(
     x_ptr,
+    residual_ptr,
     conv_ptr,
     mix_ptr,
     weight_ptr,
@@ -96,6 +106,7 @@ def _layernorm_token_shift_lerp1_decode_kernel(
     conv_stride_h: tl.constexpr,
     EPS: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
     """Fuse decode LayerNorm, FFN token shift/update and its single mix."""
@@ -103,7 +114,14 @@ def _layernorm_token_shift_lerp1_decode_kernel(
     hidden_offset = tl.arange(0, BLOCK_H)
     mask = hidden_offset < hidden_size
     row = request_index * hidden_size
+    DT = out_ptr.dtype.element_ty
     raw = tl.load(x_ptr + row + hidden_offset, mask=mask, other=0.0).to(tl.float32)
+    if HAS_RESIDUAL:
+        residual = tl.load(residual_ptr + row + hidden_offset, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        raw = (raw + residual).to(DT).to(tl.float32)
+        tl.store(x_ptr + row + hidden_offset, raw.to(DT), mask=mask)
     mean = tl.sum(tl.where(mask, raw, 0.0), axis=0) / hidden_size
     centered = tl.where(mask, raw - mean, 0.0)
     variance = tl.sum(centered * centered, axis=0) / hidden_size
@@ -112,7 +130,6 @@ def _layernorm_token_shift_lerp1_decode_kernel(
         bias = tl.load(bias_ptr + hidden_offset, mask=mask, other=0.0).to(tl.float32)
     else:
         bias = 0.0
-    DT = out_ptr.dtype.element_ty
     normalized = (centered * tl.rsqrt(variance + EPS) * weight + bias).to(DT)
     normalized_fp32 = normalized.to(tl.float32)
 
@@ -163,17 +180,27 @@ def layernorm_token_shift_lerp6_decode(
     bias: torch.Tensor | None,
     eps: float,
     cache_indices: torch.Tensor,
-) -> torch.Tensor:
+    residual: torch.Tensor | None = None,
+    return_residual_base: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Decode-only fused LayerNorm + six-way time mix and state update."""
     _validate_layernorm_decode_inputs(x, conv, mix6, weight, bias, cache_indices)
     if mix6.shape != (6, x.shape[1]):
         raise ValueError(f"mix6 must have shape (6, {x.shape[1]})")
+    if residual is not None and residual.shape != x.shape:
+        raise ValueError("residual and x must have identical shapes")
+    if residual is not None and (
+        residual.dtype != x.dtype or residual.device != x.device
+    ):
+        raise ValueError("residual and x must have identical dtype and device")
     x, mix6, weight = x.contiguous(), mix6.contiguous(), weight.contiguous()
+    residual_ptr = x if residual is None else residual.contiguous()
     bias_ptr = weight if bias is None else bias.contiguous()
     out = torch.empty(6, *x.shape, dtype=x.dtype, device=x.device)
     block_h = triton.next_power_of_2(x.shape[1])
     _layernorm_token_shift_lerp6_decode_kernel[(x.shape[0],)](
         x,
+        residual_ptr,
         conv,
         mix6,
         weight,
@@ -186,10 +213,13 @@ def layernorm_token_shift_lerp6_decode(
         conv.stride(1),
         EPS=float(eps),
         HAS_BIAS=bias is not None,
+        HAS_RESIDUAL=residual is not None,
         BLOCK_H=block_h,
         num_warps=8 if block_h >= 2048 else 4,
         enable_fp_fusion=False,
     )
+    if return_residual_base:
+        return out, x
     return out
 
 
@@ -201,16 +231,26 @@ def layernorm_token_shift_lerp1_decode(
     bias: torch.Tensor | None,
     eps: float,
     cache_indices: torch.Tensor,
-) -> torch.Tensor:
+    residual: torch.Tensor | None = None,
+    return_residual_base: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Decode-only fused LayerNorm + FFN time mix and state update."""
     mix = mix.reshape(-1)
     _validate_layernorm_decode_inputs(x, conv, mix, weight, bias, cache_indices)
+    if residual is not None and residual.shape != x.shape:
+        raise ValueError("residual and x must have identical shapes")
+    if residual is not None and (
+        residual.dtype != x.dtype or residual.device != x.device
+    ):
+        raise ValueError("residual and x must have identical dtype and device")
     x, mix, weight = x.contiguous(), mix.contiguous(), weight.contiguous()
+    residual_ptr = x if residual is None else residual.contiguous()
     bias_ptr = weight if bias is None else bias.contiguous()
     out = torch.empty_like(x)
     block_h = triton.next_power_of_2(x.shape[1])
     _layernorm_token_shift_lerp1_decode_kernel[(x.shape[0],)](
         x,
+        residual_ptr,
         conv,
         mix,
         weight,
@@ -223,10 +263,13 @@ def layernorm_token_shift_lerp1_decode(
         conv.stride(1),
         EPS=float(eps),
         HAS_BIAS=bias is not None,
+        HAS_RESIDUAL=residual is not None,
         BLOCK_H=block_h,
         num_warps=8 if block_h >= 2048 else 4,
         enable_fp_fusion=False,
     )
+    if return_residual_base:
+        return out, x
     return out
 
 

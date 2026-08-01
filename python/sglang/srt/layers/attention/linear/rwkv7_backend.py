@@ -388,7 +388,8 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
         norm_weight: Optional[torch.Tensor] = None,
         norm_bias: Optional[torch.Tensor] = None,
         norm_eps: float = 1e-5,
-    ) -> torch.Tensor:
+        residual: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Fuse normal serving token shift/state update with six time mixes.
 
         Speculative modes retain ``token_shift`` because their state protocol
@@ -413,7 +414,11 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
                 norm_bias,
                 norm_eps,
                 self.forward_metadata.mamba_cache_indices,
+                residual=residual,
+                return_residual_base=True,
             )
+        residual_base = x if residual is None else x + residual
+        x = residual_base
         if has_norm:
             x = F.layer_norm(
                 x,
@@ -423,10 +428,13 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
                 norm_eps,
             )
         if self.is_draft_worker or mode.is_draft_extend_v2() or mode.is_target_verify():
-            return fused_lerp6(
-                x,
-                self.token_shift(x, layer_id, conv_idx, forward_batch),
-                mix6,
+            return (
+                fused_lerp6(
+                    x,
+                    self.token_shift(x, layer_id, conv_idx, forward_batch),
+                    mix6,
+                ),
+                residual_base,
             )
 
         cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
@@ -434,14 +442,16 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
         md = self.forward_metadata
         cache_indices = md.mamba_cache_indices
         if mode.is_decode_or_idle():
-            return token_shift_lerp6_decode(x, conv, mix6, cache_indices)
-        return token_shift_lerp6_packed_varlen(
-            x,
-            conv,
-            mix6,
-            md.query_start_loc,
-            cache_indices,
-        )
+            out = token_shift_lerp6_decode(x, conv, mix6, cache_indices)
+        else:
+            out = token_shift_lerp6_packed_varlen(
+                x,
+                conv,
+                mix6,
+                md.query_start_loc,
+                cache_indices,
+            )
+        return out, residual_base
 
     def token_shift_lerp1(
         self,
@@ -453,7 +463,8 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
         norm_weight: Optional[torch.Tensor] = None,
         norm_bias: Optional[torch.Tensor] = None,
         norm_eps: float = 1e-5,
-    ) -> torch.Tensor:
+        residual: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Fuse the FFN decode LayerNorm, token shift and one time mix."""
         mode = forward_batch.forward_mode
         has_norm = norm_weight is not None
@@ -474,7 +485,11 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
                 norm_bias,
                 norm_eps,
                 self.forward_metadata.mamba_cache_indices,
+                residual=residual,
+                return_residual_base=True,
             )
+        residual_base = x if residual is None else x + residual
+        x = residual_base
         if has_norm:
             x = F.layer_norm(
                 x,
@@ -484,7 +499,7 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
                 norm_eps,
             )
         shifted = self.token_shift(x, layer_id, conv_idx, forward_batch)
-        return x + mix * (shifted - x)
+        return x + mix * (shifted - x), residual_base
 
     # ---- WKV recurrence (decode + extend both -> the wkv_recurrent kernel) ----
     def recurrence(
