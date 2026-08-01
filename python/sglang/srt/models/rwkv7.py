@@ -69,6 +69,11 @@ from sglang.srt.layers.attention.rwkv7_kernels.fused import (
     fused_lowrank_controls,
     is_profitable_fused_lowrank_shape,
 )
+from sglang.srt.layers.attention.rwkv7_kernels.ffn_sparse_cuda import (
+    can_use_sparse_sqrelu_down,
+    sparse_ffn_enabled,
+    sparse_sqrelu_down,
+)
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -809,6 +814,46 @@ class Rwkv7FeedForward(nn.Module):
             add_prefix("value", prefix),
             parallel="row",
         )
+        # Decode SqReLU is naturally sparse (roughly half of the expansion is
+        # exactly zero). Re-home the dense value weight in transposed contiguous
+        # storage so a zero-skipping CUDA kernel can read rows coalesced without
+        # retaining a second copy. The canonical value.weight parameter remains
+        # a correctly shaped view, preserving checkpoint and dense fallback
+        # behavior. Quantized and TP paths retain their native layouts.
+        self._value_transposed_weight = None
+        self._sparse_value_enabled = bool(
+            sparse_ffn_enabled()
+            and torch.cuda.is_available()
+            and torch.version.hip is None
+            and _tp_size() == 1
+            and value_quant_config is None
+            and getattr(self.value, "weight", None) is not None
+            and self.value.weight.ndim == 2
+        )
+        if self._sparse_value_enabled:
+            self._pack_value_weight_for_sparse()
+
+    def _pack_value_weight_for_sparse(self) -> None:
+        old_weight = self.value.weight
+        transposed = torch.empty(
+            (old_weight.shape[1], old_weight.shape[0]),
+            dtype=old_weight.dtype,
+            device=old_weight.device,
+        )
+        with torch.no_grad():
+            transposed.copy_(old_weight.t())
+        new_weight = nn.Parameter(
+            transposed.t(), requires_grad=old_weight.requires_grad
+        )
+        new_weight.__dict__.update(old_weight.__dict__)
+        self.value.weight = new_weight
+        self._value_transposed_weight = transposed
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        if self._sparse_value_enabled:
+            self._pack_value_weight_for_sparse()
+        return result
 
     def forward(
         self,
@@ -830,8 +875,18 @@ class Rwkv7FeedForward(nn.Module):
             norm_eps=1e-5 if norm is None else norm.eps,
         )
         k = self.key(xk)[0]
-        act = self.activation(k)
-        out = self.value(act)[0]
+        value_weight_t = self._value_transposed_weight
+        use_sparse_value = bool(
+            forward_batch.forward_mode.is_decode_or_idle()
+            and value_weight_t is not None
+            and self.value.weight.data_ptr() == value_weight_t.data_ptr()
+            and can_use_sparse_sqrelu_down(k, value_weight_t)
+        )
+        if use_sparse_value:
+            out = sparse_sqrelu_down(k, value_weight_t)
+        else:
+            act = self.activation(k)
+            out = self.value(act)[0]
         return out
 
 
