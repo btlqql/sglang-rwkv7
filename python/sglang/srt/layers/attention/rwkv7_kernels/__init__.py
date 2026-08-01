@@ -6,6 +6,7 @@ wkv_recurrent -> DECODE (T==1 fast path) + recurrent varlen (cu_seqlens) WKV.
 """
 
 from sglang.srt.layers.attention.rwkv7_kernels.token_shift import (
+    layernorm_residual,
     layernorm_token_shift_lerp1_decode,
     layernorm_token_shift_lerp6_decode,
     token_shift_lerp6_decode,
@@ -15,6 +16,7 @@ from sglang.srt.layers.attention.rwkv7_kernels.token_shift import (
 from sglang.srt.layers.attention.rwkv7_kernels.wkv_recurrent import wkv_recurrent
 
 __all__ = [
+    "layernorm_residual",
     "layernorm_token_shift_lerp1_decode",
     "layernorm_token_shift_lerp6_decode",
     "token_shift_lerp6_decode",

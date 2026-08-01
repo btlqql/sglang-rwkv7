@@ -10,6 +10,7 @@ from torch import nn
 
 from sglang.srt.configs.rwkv7 import Rwkv7Config
 from sglang.srt.layers.attention.rwkv7_kernels import (
+    layernorm_residual,
     layernorm_token_shift_lerp1_decode,
     layernorm_token_shift_lerp6_decode,
     token_shift_lerp6_decode,
@@ -646,6 +647,20 @@ class TestRwkv7Kernels(unittest.TestCase):
             x, conv1, mix1, weight, bias, 1e-5, indices
         )
         torch.testing.assert_close(actual1, expected1, rtol=2e-2, atol=2e-2)
+
+        final_x = torch.randn_like(x)
+        final_residual = torch.randn_like(x)
+        expected_final = F.layer_norm(
+            final_x + final_residual, (hidden,), weight, bias, 1e-5
+        )
+        final_ptr = final_x.data_ptr()
+        actual_final = layernorm_residual(final_x, final_residual, weight, bias, 1e-5)
+        self.assertEqual(actual_final.data_ptr(), final_ptr)
+        torch.testing.assert_close(actual_final, expected_final, rtol=2e-2, atol=2e-2)
+        self.assertEqual(
+            layernorm_residual(x[:0], x[:0], weight, bias, 1e-5).shape,
+            (0, hidden),
+        )
         torch.testing.assert_close(
             conv1[indices.long(), :, 0], normalized.float(), rtol=2e-2, atol=2e-2
         )

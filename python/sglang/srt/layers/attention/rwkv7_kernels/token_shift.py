@@ -16,6 +16,42 @@ import triton.language as tl
 
 
 @triton.jit
+def _layernorm_residual_kernel(
+    x_ptr,
+    residual_ptr,
+    weight_ptr,
+    bias_ptr,
+    hidden_size: tl.constexpr,
+    EPS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Fuse the final residual addition and LayerNorm in place."""
+    token_index = tl.program_id(0)
+    hidden_offset = tl.arange(0, BLOCK_H)
+    mask = hidden_offset < hidden_size
+    row = token_index * hidden_size
+    DT = x_ptr.dtype.element_ty
+
+    x = tl.load(x_ptr + row + hidden_offset, mask=mask, other=0.0).to(tl.float32)
+    residual = tl.load(residual_ptr + row + hidden_offset, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    # The unfused model performs the residual addition in the activation dtype.
+    raw = (x + residual).to(DT).to(tl.float32)
+    mean = tl.sum(tl.where(mask, raw, 0.0), axis=0) / hidden_size
+    centered = tl.where(mask, raw - mean, 0.0)
+    variance = tl.sum(centered * centered, axis=0) / hidden_size
+    weight = tl.load(weight_ptr + hidden_offset, mask=mask, other=0.0).to(tl.float32)
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + hidden_offset, mask=mask, other=0.0).to(tl.float32)
+    else:
+        bias = 0.0
+    normalized = centered * tl.rsqrt(variance + EPS) * weight + bias
+    tl.store(x_ptr + row + hidden_offset, normalized.to(DT), mask=mask)
+
+
+@triton.jit
 def _layernorm_token_shift_lerp6_decode_kernel(
     x_ptr,
     residual_ptr,
@@ -170,6 +206,44 @@ def _validate_layernorm_decode_inputs(x, conv, mix, weight, bias, cache_indices)
         raise ValueError("LayerNorm bias and weight must have identical shapes")
     if mix.shape[-1] != x.shape[1]:
         raise ValueError(f"time-mix hidden size must be {x.shape[1]}")
+
+
+def layernorm_residual(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    eps: float,
+) -> torch.Tensor:
+    """In-place activation-dtype residual addition followed by LayerNorm."""
+    if x.ndim != 2 or residual.shape != x.shape:
+        raise ValueError("x and residual must have identical two-dimensional shapes")
+    if residual.dtype != x.dtype or residual.device != x.device:
+        raise ValueError("residual and x must have identical dtype and device")
+    if weight.shape != (x.shape[1],):
+        raise ValueError(f"LayerNorm weight must have shape ({x.shape[1]},)")
+    if bias is not None and bias.shape != weight.shape:
+        raise ValueError("LayerNorm bias and weight must have identical shapes")
+    if weight.device != x.device or (bias is not None and bias.device != x.device):
+        raise ValueError("LayerNorm parameters and x must be on the same device")
+    if x.shape[0] == 0:
+        return x
+    x, residual, weight = x.contiguous(), residual.contiguous(), weight.contiguous()
+    bias_ptr = weight if bias is None else bias.contiguous()
+    block_h = triton.next_power_of_2(x.shape[1])
+    _layernorm_residual_kernel[(x.shape[0],)](
+        x,
+        residual,
+        weight,
+        bias_ptr,
+        x.shape[1],
+        EPS=float(eps),
+        HAS_BIAS=bias is not None,
+        BLOCK_H=block_h,
+        num_warps=8 if block_h >= 2048 else 4,
+        enable_fp_fusion=False,
+    )
+    return x
 
 
 def layernorm_token_shift_lerp6_decode(
