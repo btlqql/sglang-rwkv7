@@ -26,6 +26,11 @@ def _load_wkv_varlen_fp16_extension() -> bool:
         from torch.utils.cpp_extension import load
 
         source_dir = Path(__file__).resolve().parent / "cuda"
+        device_flags = ["-O3", "-DNDEBUG"]
+        if torch.version.hip is None:
+            device_flags += ["--use_fast_math"]
+        else:
+            device_flags += ["-ffast-math"]
         load(
             name="sglang_rwkv7_wkv_varlen_fp16_v4",
             sources=[
@@ -33,7 +38,7 @@ def _load_wkv_varlen_fp16_extension() -> bool:
                 str(source_dir / "wkv_varlen_fp16.cu"),
             ],
             extra_cflags=["-O3", "-std=c++17", "-DNDEBUG"],
-            extra_cuda_cflags=["-O3", "--use_fast_math", "-DNDEBUG"],
+            extra_cuda_cflags=device_flags,
             is_python_module=False,
             verbose=os.getenv("SGLANG_RWKV7_CUDA_BUILD_VERBOSE", "0") == "1",
         )
