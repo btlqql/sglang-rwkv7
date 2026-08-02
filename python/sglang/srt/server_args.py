@@ -134,6 +134,8 @@ LOAD_FORMAT_CHOICES = [
 # TODO: this list should likely contain only methods that support online quantization, or that support using custom quantization classes compatible with a given `quant_method` in config.json.
 # Some of the choices here do NOT support online quantization.
 QUANTIZATION_CHOICES = [
+    "rwkv7_w8",
+    "rwkv7_w4",
     "awq",
     "fp8",  # MOE + linear online quantization.
     "mxfp8",  # MOE + linear online quantization.
@@ -8229,10 +8231,7 @@ class ServerArgs:
     def _resolved_attention_backends(self):
         """Mid-resolution (prefill, decode) backends: reads through the pass
         view so declared fields resolve from the declaration stash."""
-        from sglang.srt.arg_groups.overrides import (
-            attention_backends_of,
-            resolved_view,
-        )
+        from sglang.srt.arg_groups.overrides import attention_backends_of, resolved_view
 
         return attention_backends_of(resolved_view(self))
 

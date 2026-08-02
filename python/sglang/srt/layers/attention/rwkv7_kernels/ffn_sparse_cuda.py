@@ -1,6 +1,6 @@
 # Copyright 2025-2026 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
-"""Optional zero-skipping CUDA path for RWKV-7 SqReLU FFN down."""
+"""Optional zero-skipping CUDA/HIP path for RWKV-7 SqReLU FFN down."""
 
 from __future__ import annotations
 
@@ -29,16 +29,16 @@ def sparse_ffn_max_rows() -> int:
 def _load_sparse_ffn_extension() -> bool:
     if not sparse_ffn_enabled():
         return False
-    if not torch.cuda.is_available() or torch.version.hip is not None:
+    if not torch.cuda.is_available():
         return False
-    if torch.cuda.get_device_capability()[0] < 7:
+    if torch.version.hip is None and torch.cuda.get_device_capability()[0] < 7:
         return False
     try:
         from torch.utils.cpp_extension import load
 
         source_dir = Path(__file__).resolve().parent / "cuda"
         load(
-            name="sglang_rwkv7_sparse_ffn_fp16_v2",
+            name="sglang_rwkv7_sparse_ffn_fp16_v3",
             sources=[
                 str(source_dir / "ffn_sparse.cpp"),
                 str(source_dir / "ffn_sparse.cu"),
@@ -53,11 +53,11 @@ def _load_sparse_ffn_extension() -> bool:
             is_python_module=False,
             verbose=os.getenv("SGLANG_RWKV7_CUDA_BUILD_VERBOSE", "0") == "1",
         )
-        logger.info("Loaded the optional RWKV-7 sparse SqReLU FFN CUDA path.")
+        logger.info("Loaded the optional RWKV-7 sparse SqReLU FFN CUDA/HIP path.")
         return True
     except Exception:
         logger.warning(
-            "Failed to build the optional RWKV-7 sparse SqReLU FFN CUDA path; "
+            "Failed to build the optional RWKV-7 sparse SqReLU FFN CUDA/HIP path; "
             "falling back to the dense projection.",
             exc_info=True,
         )

@@ -6,6 +6,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.quantization.bitsandbytes import BitsAndBytesLinearMethod
+from sglang.srt.layers.quantization.rwkv7_native import online_quantize_rwkv7_w4_weight
 from sglang.srt.models.rwkv7 import (
     _rwkv7_bnb_target_modules,
     _rwkv7_int8_exact_max_tokens,
@@ -103,6 +104,50 @@ class TestRwkv7QuantPolicy(unittest.TestCase):
                 _rwkv7_projection_quant_config(quant, "ffn_value", 13, 24).get_name(),
                 "w8a8_int8",
             )
+
+    def test_native_w4_accuracy_uses_native_w8_contraction(self):
+        quant = FakeQuantConfig("rwkv7_w4")
+        with patch.dict(os.environ, {"SGLANG_RWKV7_W4_POLICY": "accuracy"}):
+            self.assertIsNone(
+                _rwkv7_projection_quant_config(quant, "attention", 12, 24)
+            )
+            self.assertIs(
+                _rwkv7_projection_quant_config(quant, "ffn_key", 12, 24), quant
+            )
+            self.assertEqual(
+                _rwkv7_projection_quant_config(quant, "ffn_value", 12, 24).get_name(),
+                "rwkv7_w8",
+            )
+
+    def test_native_w8_accuracy_quantizes_interior_ffn_only(self):
+        quant = FakeQuantConfig("rwkv7_w8")
+        with patch.dict(os.environ, {"SGLANG_RWKV7_W8_POLICY": "accuracy"}):
+            self.assertIsNone(
+                _rwkv7_projection_quant_config(quant, "attention", 12, 24)
+            )
+            for projection in ("ffn_key", "ffn_value"):
+                self.assertIs(
+                    _rwkv7_projection_quant_config(quant, projection, 12, 24),
+                    quant,
+                )
+                for layer_id in (0, 3, 20, 23):
+                    self.assertIsNone(
+                        _rwkv7_projection_quant_config(quant, projection, layer_id, 24)
+                    )
+
+    def test_native_w4_pack_roundtrip(self):
+        weight = torch.linspace(-1.0, 1.0, 2 * 128).reshape(2, 128)
+        packed, scale = online_quantize_rwkv7_w4_weight(weight)
+        self.assertEqual(packed.dtype, torch.uint8)
+        self.assertEqual(tuple(packed.shape), (2, 64))
+        self.assertEqual(tuple(scale.shape), (2, 4))
+        low = (packed & 15).to(torch.int16) - 8
+        high = ((packed >> 4) & 15).to(torch.int16) - 8
+        unpacked = torch.stack((low, high), dim=-1).reshape(2, 128)
+        reconstructed = unpacked.float() * scale.float().repeat_interleave(32, dim=1)
+        self.assertLessEqual(
+            float((reconstructed - weight).abs().max()), float(scale.max())
+        )
 
     def test_speed_policies_quantize_every_large_projection(self):
         for env_name, quant_name in (

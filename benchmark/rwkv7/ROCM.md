@@ -1,10 +1,10 @@
 # RWKV-7 on ROCm
 
-RWKV-7 can use SGLang's portable Triton serving path on AMD GPUs without
-`sgl-kernel` or a device-specific AITER build.  The fallback covers dense
-generation, decode graphs, dynamic batching, chunked prefill, recurrent state
-cache, abort/reuse lifecycle handling, xgrammar masking, and the imports used by
-the speculative scheduler.
+RWKV-7 can use SGLang's native CUDA/HIP and portable Triton serving paths on
+AMD GPUs without `sgl-kernel`, bitsandbytes, or a device-specific AITER build.
+The fallback covers dense and native W8/W4 generation, decode graphs, dynamic
+batching, chunked prefill, recurrent state cache, abort/reuse lifecycle
+handling, xgrammar masking, and the imports used by the speculative scheduler.
 
 ## Environment
 
@@ -14,18 +14,18 @@ The initial RDNA validation used:
 - ROCm 7.2.1;
 - PyTorch 2.9.1 (HIP 7.2 build);
 - Triton 3.5.1;
-- bitsandbytes 0.49.2 for the optional W8/W4 lanes.
+- bitsandbytes 0.49.2 for the legacy optional W8/W4 lanes.
 
-ROCm support in bitsandbytes is still marked preview by that project.  Install
-0.49 or newer when using W8/W4:
+ROCm support in bitsandbytes is still marked preview by that project. Install
+0.49 or newer only when using the legacy `w8` or `w4` launch modes:
 
 ```bash
 python -m pip install 'bitsandbytes>=0.49,<0.50'
 python -m bitsandbytes
 ```
 
-The diagnostic must report that ROCm is callable.  Dense serving does not
-depend on bitsandbytes.
+The diagnostic must report that ROCm is callable. Dense serving and the
+`native-w8`/`native-w4` modes do not depend on bitsandbytes.
 
 ## Launch
 
@@ -36,6 +36,8 @@ batch size 8:
 benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-hf dense
 benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-hf w8
 benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-hf w4
+benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-hf native-w8
+benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-hf native-w4
 ```
 
 Additional SGLang arguments can follow the mode.  PyTorch retains the CUDA API
@@ -48,6 +50,15 @@ dedicated environment that is not activated in the current shell:
 ```bash
 SGLANG_PYTHON=/opt/venv/bin/python \
   benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-hf dense
+```
+
+The native modes default recurrent state to FP16 so the packed-varlen HIP WKV
+kernel can be selected. Override this explicitly when a stricter state lane is
+required:
+
+```bash
+SGLANG_RWKV7_SSM_DTYPE=float32 \
+  benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-hf native-w8
 ```
 
 The script disables AITER by default because consumer RDNA wheels may omit the
@@ -125,15 +136,32 @@ The model-load telemetry measured 2.93 GB for dense FP16, 2.56 GB for W8
 accuracy, and 2.87 GB for W4 accuracy.  Full-model W8/W4 reduced model memory
 to 1.72/1.20 GB, but did not pass the same accuracy gate; full W4 was also much
 slower at batch 8.  Consequently, full quantization and batch-8 quant speed are
-not production acceptance claims yet.  A tuned ROCm weight-only GEMM is still
-needed before W8/W4 can satisfy the all-batch "not slower than FP16" target.
+not production acceptance claims for the legacy bitsandbytes path.
+
+### Native W8/W4 kernels
+
+The native modes avoid the bitsandbytes and AITER dependency:
+
+- decode and small batches use a row-streaming weight-only Triton kernel;
+- large prefills dynamically quantize activations per token and use an INT8
+  dot-product kernel with INT32 accumulation;
+- W8 weights use symmetric per-output-channel scales;
+- W4 expansion weights use symmetric group-32 packing, while protected
+  contraction projections use the native W8 path;
+- recurrent attention, low-rank controls and edge FFN blocks stay FP16 under
+  the default accuracy policy; the native row-streaming kernel also covers the
+  wide LM head.
+
+The CUDA/HIP WKV and sparse SqReLU extensions are local JIT fast paths. If the
+installed compiler cannot build one of them, dispatch fails closed to the
+portable Triton WKV or dense FFN implementation.
 
 ## Current limitations
 
-- Native `sgl-kernel` quantizers require a matching ROCm wheel.  Missing native
-  kernels no longer prevent dense or BitsAndBytes startup.
+- Native `sgl-kernel` quantizers require a matching ROCm wheel. Missing
+  `sgl-kernel` no longer prevents dense, BitsAndBytes, or RWKV-native W8/W4
+  startup.
 - Quark remains unavailable when the installed AITER package lacks
   `aiter.ops.triton.gemm`; other available ROCm quantizers stay registered.
-- The optional CUDA C++ WKV prefill and sparse SqReLU kernels are NVIDIA-only.
-  ROCm currently uses the portable Triton WKV and dense FFN paths.
-- W8/W4 batch-8 speed still trails dense FP16 on the tested RDNA device.
+- Consumer RDNA and CDNA targets require separate performance evidence; a
+  successful HIP JIT build alone is not treated as an acceptance result.

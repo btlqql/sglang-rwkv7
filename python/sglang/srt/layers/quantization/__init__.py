@@ -77,6 +77,7 @@ PetitNvFp4Config = QuarkConfig = QuarkInt4Fp8Config = DummyConfig
 W4AFp8Config = W8A8Fp8Config = W8A8Int8Config = DummyConfig
 
 from sglang.srt.layers.quantization.bitsandbytes import BitsAndBytesConfig
+from sglang.srt.layers.quantization.rwkv7_native import RWKV7W4Config, RWKV7W8Config
 
 if not _legacy_cuda and (not is_cuda() or _sgl_kernel_available):
     from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
@@ -148,6 +149,8 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "awq": AWQConfig,
     "awq_marlin": AWQMarlinConfig,
     "bitsandbytes": BitsAndBytesConfig,
+    "rwkv7_w8": RWKV7W8Config,
+    "rwkv7_w4": RWKV7W4Config,
     "gguf": GGUFConfig,
     "gptq": GPTQConfig,
     "gptq_marlin": GPTQMarlinConfig,

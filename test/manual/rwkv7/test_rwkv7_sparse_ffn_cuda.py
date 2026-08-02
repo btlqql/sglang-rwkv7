@@ -14,9 +14,8 @@ from sglang.srt.layers.attention.rwkv7_kernels.ffn_sparse_cuda import (
 
 @unittest.skipUnless(
     torch.cuda.is_available()
-    and torch.version.hip is None
-    and torch.cuda.get_device_capability()[0] >= 7,
-    "requires NVIDIA CUDA sm70+",
+    and (torch.version.hip is not None or torch.cuda.get_device_capability()[0] >= 7),
+    "requires CUDA sm70+ or ROCm",
 )
 class TestRWKV7SparseFFNCUDA(unittest.TestCase):
     def test_sqrelu_down_matches_dense(self):

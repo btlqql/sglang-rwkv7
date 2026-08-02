@@ -1,0 +1,17 @@
+{
+  "gpu": "NVIDIA GeForce RTX 4080",
+  "pytorch": "2.11.0+cu130",
+  "cuda": "13.0",
+  "hip": null,
+  "triton": "3.6.0",
+  "python": "3.12.2",
+  "model": "RWKV-7 G1 1.5B",
+  "dtype": "float16",
+  "state_dtype": "float16",
+  "batch_sizes": [8],
+  "prompt_tokens_per_request": [128, 512, 2048],
+  "decode_tokens_per_request": [128],
+  "warmups": 2,
+  "repeats": 5,
+  "cache_flushed_each_run": true
+}

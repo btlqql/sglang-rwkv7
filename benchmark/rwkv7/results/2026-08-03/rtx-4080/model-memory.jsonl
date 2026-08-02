@@ -1,0 +1,3 @@
+{"mode":"dense_fp16","model_memory_gb":2.86,"source":"server load telemetry"}
+{"mode":"rwkv7_w8","model_memory_gb":2.41,"change_from_dense":-0.157,"source":"server load telemetry"}
+{"mode":"rwkv7_w4","model_memory_gb":2.40,"change_from_dense":-0.161,"source":"server load telemetry"}

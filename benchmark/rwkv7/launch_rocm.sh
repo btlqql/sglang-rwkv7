@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "usage: $0 MODEL_PATH [dense|w8|w4] [additional sglang arguments...]" >&2
+  echo "usage: $0 MODEL_PATH [dense|w8|w4|native-w8|native-w4] [additional sglang arguments...]" >&2
   exit 2
 fi
 
@@ -22,10 +22,13 @@ export SGLANG_RWKV7_BNB_POLICY=${SGLANG_RWKV7_BNB_POLICY:-accuracy}
 python_bin=${SGLANG_PYTHON:-python}
 
 quant_args=()
+state_dtype=${SGLANG_RWKV7_SSM_DTYPE:-}
 case "$mode" in
   dense)
+    state_dtype=${state_dtype:-float32}
     ;;
   w8)
+    state_dtype=${state_dtype:-float32}
     quant_args=(
       --quantization bitsandbytes
       --load-format bitsandbytes
@@ -34,6 +37,7 @@ case "$mode" in
     )
     ;;
   w4)
+    state_dtype=${state_dtype:-float32}
     quant_args=(
       --quantization bitsandbytes
       --load-format bitsandbytes
@@ -41,8 +45,16 @@ case "$mode" in
       '{"load_in_8bit":false,"load_in_4bit":true,"bnb_4bit_compute_dtype":"float16","bnb_4bit_quant_type":"nf4"}'
     )
     ;;
+  native-w8)
+    state_dtype=${state_dtype:-float16}
+    quant_args=(--quantization rwkv7_w8)
+    ;;
+  native-w4)
+    state_dtype=${state_dtype:-float16}
+    quant_args=(--quantization rwkv7_w4)
+    ;;
   *)
-    echo "unsupported mode: $mode (expected dense, w8, or w4)" >&2
+    echo "unsupported mode: $mode (expected dense, w8, w4, native-w8, or native-w4)" >&2
     exit 2
     ;;
 esac
@@ -52,7 +64,7 @@ exec "$python_bin" -m sglang.launch_server \
   --trust-remote-code \
   --attention-backend triton \
   --dtype float16 \
-  --mamba-ssm-dtype float32 \
+  --mamba-ssm-dtype "$state_dtype" \
   --max-running-requests 8 \
   --chunked-prefill-size 2048 \
   --cuda-graph-backend-decode full \
