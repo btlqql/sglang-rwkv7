@@ -381,7 +381,8 @@ class BitsAndBytesLinearMethod(LinearMethodBase):
         if x.ndim > 2:
             x = x.reshape(-1, x.size(-1))
             reshape_after_matmul = True
-        bf_x = x.to(torch.bfloat16)
+        compute_dtype = getattr(torch, self.quant_config.bnb_4bit_compute_dtype)
+        quant_x = x.to(compute_dtype)
 
         qweight = layer.weight
         quant_states = qweight.bnb_quant_state
@@ -391,8 +392,8 @@ class BitsAndBytesLinearMethod(LinearMethodBase):
         out_dim_1 = sum(
             [quant_state[1].shape[0] for quant_state in quant_states.items()]
         )
-        out = torch.empty(out_dim_0, out_dim_1, dtype=torch.bfloat16, device=x.device)
-        apply_bnb_4bit(bf_x, qweight, offsets, out)
+        out = torch.empty(out_dim_0, out_dim_1, dtype=compute_dtype, device=x.device)
+        apply_bnb_4bit(quant_x, qweight, offsets, out)
         out = out.to(original_type)
 
         if reshape_after_matmul:

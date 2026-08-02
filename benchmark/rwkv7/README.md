@@ -322,6 +322,9 @@ BitsAndBytes is the legacy functional and memory-saving fallback; it is not the
 optimized quantization speed path. Use online W8A8 or Marlin on their supported
 architectures when throughput is the acceptance criterion.
 
+For AMD/ROCm installation, launch commands, correctness evidence, and measured
+RDNA performance, see [ROCM.md](ROCM.md).
+
 ## Hugging Face alignment
 
 For native `rwkv-rs/hf-adapter` checkpoints, the alignment harness first runs

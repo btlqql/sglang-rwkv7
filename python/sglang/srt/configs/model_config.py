@@ -1354,6 +1354,7 @@ class ModelConfig:
     def _verify_quantization(self) -> None:
         supported_quantization = [*QUANTIZATION_METHODS]
         rocm_supported_quantization = [
+            "bitsandbytes",
             "awq",
             "gptq",
             "fp8",

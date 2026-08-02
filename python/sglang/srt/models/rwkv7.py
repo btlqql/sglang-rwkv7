@@ -156,6 +156,49 @@ def _rwkv7_w4_policy() -> str:
     return policy
 
 
+def _rwkv7_bnb_policy() -> str:
+    """Select the BitsAndBytes accuracy/compression trade-off.
+
+    BitsAndBytes is also the portable W8/W4 path on ROCm.  Quantizing every
+    recurrent projection is useful as a throughput-oriented lane, but it is a
+    poor default for RWKV because projection error is carried in the recurrent
+    state.  The accuracy lane quantizes only the large FFN contraction, while
+    balanced additionally quantizes the FFN expansion.
+    """
+    policy = os.getenv("SGLANG_RWKV7_BNB_POLICY", "accuracy").lower()
+    if policy not in ("accuracy", "balanced", "speed"):
+        raise ValueError(
+            "SGLANG_RWKV7_BNB_POLICY must be accuracy, balanced, or speed; "
+            f"got {policy!r}."
+        )
+    return policy
+
+
+def _rwkv7_bnb_target_modules(
+    quant_config: QuantizationConfig, num_hidden_layers: int
+) -> list[str]:
+    """Return loader targets matching the projection policy above."""
+    policy = _rwkv7_bnb_policy()
+    if policy == "speed":
+        return [
+            ".r_proj.",
+            ".k_proj.",
+            ".v_proj.",
+            ".o_proj.",
+            ".key.",
+            ".value.",
+        ]
+    if policy == "balanced":
+        return [".key.", ".value."]
+    if quant_config.load_in_8bit:
+        return [".value."]
+    edge_layers = min(4, max(1, num_hidden_layers // 6))
+    return [
+        f".layers.{layer_id}.ffn.value."
+        for layer_id in range(edge_layers, num_hidden_layers - edge_layers, 4)
+    ]
+
+
 def _rwkv7_marlin_fallback_max_tokens() -> int:
     """Token-count limit for the batch-invariant W4 accuracy shadow."""
     raw = os.getenv("SGLANG_RWKV7_MARLIN_FALLBACK_MAX_TOKENS", "512")
@@ -244,6 +287,29 @@ def _rwkv7_projection_quant_config(
         raise ValueError(f"Unknown RWKV-7 projection class: {projection!r}")
 
     name = quant_config.get_name()
+    if name == "bitsandbytes":
+        policy = _rwkv7_bnb_policy()
+        if policy == "speed":
+            return quant_config
+        if projection == "attention":
+            return None
+        if policy == "accuracy" and projection == "ffn_key":
+            return None
+        if (
+            policy == "accuracy"
+            and not quant_config.load_in_8bit
+            and projection == "ffn_value"
+        ):
+            if layer_id is None or num_hidden_layers is None:
+                raise ValueError("BitsAndBytes W4 FFN policy requires layer metadata")
+            edge_layers = min(4, max(1, num_hidden_layers // 6))
+            if (
+                layer_id < edge_layers
+                or layer_id >= num_hidden_layers - edge_layers
+                or (layer_id - edge_layers) % 4
+            ):
+                return None
+
     if name == "w8a8_int8":
         policy = _rwkv7_w8_policy()
         if policy == "speed":
@@ -1130,6 +1196,10 @@ class Rwkv7ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        if quant_config is not None and quant_config.get_name() == "bitsandbytes":
+            self.default_bitsandbytes_target_modules = _rwkv7_bnb_target_modules(
+                quant_config, config.num_hidden_layers
+            )
         self.pp_group = get_pp_group()
         self.model = Rwkv7Model(
             config, quant_config, prefix=add_prefix("model", prefix)
