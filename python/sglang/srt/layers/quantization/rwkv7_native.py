@@ -229,6 +229,33 @@ def _w4_matmul_kernel(
     )
 
 
+@triton.jit
+def _w4_dequant_kernel(
+    weight_ptr,
+    scale_ptr,
+    out_ptr,
+    total_elements,
+    K: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Expand packed W4 into a transient dense projection weight."""
+    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offset < total_elements
+    n = offset // K
+    k = offset % K
+    packed_k = K // 2
+    groups_k = K // GROUP_SIZE
+    packed = tl.load(weight_ptr + n * packed_k + k // 2, mask=mask, other=0).to(
+        tl.int32
+    )
+    quant = ((packed >> ((k & 1) * 4)) & 15) - 8
+    scale = tl.load(
+        scale_ptr + n * groups_k + k // GROUP_SIZE, mask=mask, other=0.0
+    ).to(tl.float32)
+    tl.store(out_ptr + offset, quant.to(tl.float32) * scale, mask=mask)
+
+
 def _decode_block_k(k: int, bits: int) -> int:
     # Large reduction tiles amortize the one-program-per-output launch without
     # re-reading a packed row. INT4 needs more registers for unpacking/scales.
@@ -311,6 +338,26 @@ def rwkv7_w4_linear(
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     m, k = x_2d.shape
     n = weight.shape[0]
+    if torch.version.hip is not None and m >= 1024:
+        # On RDNA, large group-scaled W4 tiles are limited by repeated unpack
+        # and scale work. Expanding one projection at a time keeps persistent
+        # storage packed while allowing rocBLAS to use its tuned fp16 GEMM.
+        # The transient weight is released after this projection and therefore
+        # does not turn the model into a permanent fp16 shadow copy.
+        dequant_weight = torch.empty((n, k), dtype=x.dtype, device=x.device)
+        total_elements = n * k
+        block = 256
+        _w4_dequant_kernel[(triton.cdiv(total_elements, block),)](
+            weight,
+            scale,
+            dequant_weight,
+            total_elements,
+            K=k,
+            GROUP_SIZE=group_size,
+            BLOCK=block,
+            num_warps=4,
+        )
+        return torch.mm(x_2d, dequant_weight.t()).view(*original_shape, n)
     out = torch.empty((m, n), dtype=x.dtype, device=x.device)
     if m <= 8:
         block_k = _decode_block_k(k, 4)

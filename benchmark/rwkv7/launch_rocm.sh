@@ -20,6 +20,7 @@ export SGLANG_USE_AITER=${SGLANG_USE_AITER:-0}
 export USE_ROCM_AITER_ROPE_BACKEND=${USE_ROCM_AITER_ROPE_BACKEND:-0}
 export SGLANG_RWKV7_BNB_POLICY=${SGLANG_RWKV7_BNB_POLICY:-accuracy}
 python_bin=${SGLANG_PYTHON:-python}
+chunked_prefill_size=${SGLANG_RWKV7_ROCM_CHUNKED_PREFILL_SIZE:-8192}
 
 quant_args=()
 state_dtype=${SGLANG_RWKV7_SSM_DTYPE:-}
@@ -66,7 +67,7 @@ exec "$python_bin" -m sglang.launch_server \
   --dtype float16 \
   --mamba-ssm-dtype "$state_dtype" \
   --max-running-requests 8 \
-  --chunked-prefill-size 2048 \
+  --chunked-prefill-size "$chunked_prefill_size" \
   --cuda-graph-backend-decode full \
   --cuda-graph-max-bs-decode 8 \
   --cuda-graph-backend-prefill disabled \

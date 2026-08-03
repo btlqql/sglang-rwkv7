@@ -22,6 +22,8 @@ def _load_wkv_varlen_fp16_extension() -> bool:
         return False
     if torch.version.hip is None and torch.cuda.get_device_capability()[0] < 8:
         return False
+    previous_rocm_arch = os.environ.get("PYTORCH_ROCM_ARCH")
+    restore_rocm_arch = False
     try:
         from torch.utils.cpp_extension import load
 
@@ -31,6 +33,10 @@ def _load_wkv_varlen_fp16_extension() -> bool:
             device_flags += ["--use_fast_math"]
         else:
             device_flags += ["-ffast-math"]
+            if not previous_rocm_arch:
+                device = torch.cuda.get_device_properties(torch.cuda.current_device())
+                os.environ["PYTORCH_ROCM_ARCH"] = device.gcnArchName.split(":", 1)[0]
+                restore_rocm_arch = True
         load(
             name="sglang_rwkv7_wkv_varlen_fp16_v4",
             sources=[
@@ -51,6 +57,12 @@ def _load_wkv_varlen_fp16_extension() -> bool:
             exc_info=True,
         )
         return False
+    finally:
+        if restore_rocm_arch:
+            if previous_rocm_arch is None:
+                os.environ.pop("PYTORCH_ROCM_ARCH", None)
+            else:
+                os.environ["PYTORCH_ROCM_ARCH"] = previous_rocm_arch
 
 
 def can_use_wkv_varlen_fp16_cuda(

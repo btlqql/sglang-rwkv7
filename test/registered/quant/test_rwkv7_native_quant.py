@@ -43,7 +43,7 @@ class TestRwkv7NativeQuant(unittest.TestCase):
         quant = torch.stack((low, high), dim=-1).reshape_as(self.weight)
         dequant = quant.float() * scale.float().repeat_interleave(32, dim=1)
 
-        for rows in (8, 512):
+        for rows in (8, 512, 1024):
             inputs = torch.randn(
                 rows, self.weight.shape[1], device="cuda", dtype=torch.float16
             )

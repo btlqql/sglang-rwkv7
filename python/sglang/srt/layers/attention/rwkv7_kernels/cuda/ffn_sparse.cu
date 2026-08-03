@@ -26,13 +26,40 @@
 namespace {
 
 #if defined(__HIP_PLATFORM_AMD__)
+#if defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__)
+constexpr int kHardwareWarp = 32;
+#else
 constexpr int kHardwareWarp = 64;
+#endif
 using ballot_type = unsigned long long;
 __device__ __forceinline__ ballot_type rwkv7_ballot(bool predicate) {
   return __ballot(predicate);
 }
 __device__ __forceinline__ int rwkv7_popcount(ballot_type value) {
   return __popcll(value);
+}
+
+union rwkv7_half2_bits {
+  half2 value;
+  unsigned bits;
+};
+
+__device__ __forceinline__ void rwkv7_atomic_add_half2(half2 *address,
+                                                       half2 value) {
+  auto *bits = reinterpret_cast<unsigned *>(address);
+  rwkv7_half2_bits old;
+  old.bits = atomicCAS(bits, 0u, 0u);
+  while (true) {
+    const rwkv7_half2_bits assumed = old;
+    const float2 lhs = __half22float2(assumed.value);
+    const float2 rhs = __half22float2(value);
+    rwkv7_half2_bits updated;
+    updated.value = __floats2half2_rn(lhs.x + rhs.x, lhs.y + rhs.y);
+    old.bits = atomicCAS(bits, assumed.bits, updated.bits);
+    if (old.bits == assumed.bits) {
+      return;
+    }
+  }
 }
 #else
 constexpr int kHardwareWarp = 32;
@@ -43,11 +70,15 @@ __device__ __forceinline__ ballot_type rwkv7_ballot(bool predicate) {
 __device__ __forceinline__ int rwkv7_popcount(ballot_type value) {
   return __popc(value);
 }
+
+__device__ __forceinline__ void rwkv7_atomic_add_half2(half2 *address,
+                                                       half2 value) {
+  atomicAdd(address, value);
+}
 #endif
 
 __device__ __forceinline__ ballot_type rwkv7_lane_prefix_mask(int lane) {
-  return lane == 0 ? ballot_type{0}
-                   : (~ballot_type{0} >> (kHardwareWarp - lane));
+  return lane == 0 ? ballot_type{0} : (ballot_type{1} << lane) - 1;
 }
 
 constexpr int kThreads = 128;
@@ -114,10 +145,10 @@ __global__ __launch_bounds__(kThreads, 4) void rwkv7_sparse_sqrelu_down_kernel(
         __hfma2(__half2half2(activation[local_f]), weight, accumulator);
   }
 
-  atomicAdd(reinterpret_cast<half2 *>(output +
-                                      static_cast<int64_t>(row) * hidden_size +
-                                      output_begin + tid * 2),
-            accumulator);
+  rwkv7_atomic_add_half2(reinterpret_cast<half2 *>(
+                             output + static_cast<int64_t>(row) * hidden_size +
+                             output_begin + tid * 2),
+                         accumulator);
 }
 
 __global__ __launch_bounds__(256, 2) void rwkv7_sparse_sqrelu_down_t512_kernel(
@@ -198,10 +229,10 @@ __global__ __launch_bounds__(256, 2) void rwkv7_sparse_sqrelu_down_t512_kernel(
         __hfma2(__half2half2(activation[local_f]), weight, accumulator);
   }
 
-  atomicAdd(reinterpret_cast<half2 *>(output +
-                                      static_cast<int64_t>(row) * hidden_size +
-                                      output_begin + tid * 2),
-            accumulator);
+  rwkv7_atomic_add_half2(reinterpret_cast<half2 *>(
+                             output + static_cast<int64_t>(row) * hidden_size +
+                             output_begin + tid * 2),
+                         accumulator);
 }
 
 } // namespace
