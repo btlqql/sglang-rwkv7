@@ -7,12 +7,13 @@ import torch
 
 from sglang.srt.layers.quantization.bitsandbytes import BitsAndBytesLinearMethod
 from sglang.srt.layers.quantization.rwkv7_native import online_quantize_rwkv7_w4_weight
-from sglang.srt.models.rwkv7 import (
+from sglang.srt.models.rwkv7_quant_policy import (
     _rwkv7_bnb_target_modules,
     _rwkv7_int8_exact_max_tokens,
     _rwkv7_marlin_fallback_max_tokens,
     _rwkv7_projection_quant_config,
     _rwkv7_w4_shadow_mode,
+    rwkv7_quantization_plan,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -78,7 +79,7 @@ class TestRwkv7QuantPolicy(unittest.TestCase):
         with (
             patch.dict(os.environ, {"SGLANG_RWKV7_W4_POLICY": "accuracy"}),
             patch(
-                "sglang.srt.models.rwkv7._rwkv7_w8a8_config",
+                "sglang.srt.models.rwkv7_quant_policy._rwkv7_w8a8_config",
                 return_value=FakeQuantConfig("w8a8_int8"),
             ),
         ):
@@ -134,6 +135,24 @@ class TestRwkv7QuantPolicy(unittest.TestCase):
                     self.assertIsNone(
                         _rwkv7_projection_quant_config(quant, projection, layer_id, 24)
                     )
+
+    def test_native_w4_plan_is_explicit_and_serializable(self):
+        quant = FakeQuantConfig("rwkv7_w4")
+        with patch.dict(os.environ, {"SGLANG_RWKV7_W4_POLICY": "accuracy"}):
+            plan = rwkv7_quantization_plan(quant, 12)
+        self.assertEqual(len(plan), 12)
+        self.assertEqual(
+            plan[0],
+            {
+                "layer": 0,
+                "attention": "fp16",
+                "ffn_key": "fp16",
+                "ffn_value": "fp16",
+            },
+        )
+        self.assertEqual(plan[2]["ffn_key"], "rwkv7_w4")
+        self.assertEqual(plan[2]["ffn_value"], "rwkv7_w8")
+        self.assertEqual(plan[3]["ffn_key"], "rwkv7_w8")
 
     def test_native_w4_pack_roundtrip(self):
         weight = torch.linspace(-1.0, 1.0, 2 * 128).reshape(2, 128)

@@ -12,6 +12,21 @@ A single microbenchmark is not an acceptance result. Promote a configuration
 only after the same model, dtype, state precision, graph mode, batch, prompt,
 and decode lengths pass correctness, memory, and end-to-end serving gates.
 
+## Implementation boundaries
+
+RWKV-7 keeps model semantics, precision policy, and hardware dispatch separate:
+
+- `models/rwkv7.py` owns the model graph, TP/PP layout, and weight loading;
+- `models/rwkv7_quant_policy.py` owns the per-projection FP16/W8/W4 policy;
+- `quantization/rwkv7_native.py` owns packed weights and Triton launchers;
+- `quantization/rwkv7_dispatch.py` owns cached shape/backend launch plans.
+
+New hardware paths should dispatch on capabilities, tensor shapes, and backend
+contracts rather than GPU product names. Every specialized path must retain a
+portable fallback and add boundary-selection plus numerical tests. A device is
+promoted only after the full acceptance matrix passes on that device; an
+untested architecture must not inherit a performance claim from a related GPU.
+
 ## HF-standard batch matrix
 
 `bench_acceptance_matrix.py` drives the streaming API and records TTFT, prefill
@@ -136,8 +151,9 @@ SGLANG_RWKV7_W8_POLICY=accuracy|balanced|speed
 SGLANG_RWKV7_W4_POLICY=accuracy|balanced|speed|sparse
 ```
 
-Low-rank controls and lm_head stay dense for these paths. The recurrent WKV
-state is not weight-quantized.
+Low-rank controls stay dense and the recurrent WKV state is not
+weight-quantized. Legacy W8A8/Marlin keep `lm_head` dense; the native
+`rwkv7_w8`/`rwkv7_w4` modes quantize it with their row-streaming kernels.
 
 ### W8A8 INT8
 

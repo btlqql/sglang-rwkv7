@@ -22,6 +22,11 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.rwkv7_dispatch import (
+    rwkv7_kernel_capabilities,
+    select_rwkv7_w4_kernel,
+    select_rwkv7_w8_kernel,
+)
 
 _W4_GROUP_SIZE = 32
 
@@ -256,13 +261,6 @@ def _w4_dequant_kernel(
     tl.store(out_ptr + offset, quant.to(tl.float32) * scale, mask=mask)
 
 
-def _decode_block_k(k: int, bits: int) -> int:
-    # Large reduction tiles amortize the one-program-per-output launch without
-    # re-reading a packed row. INT4 needs more registers for unpacking/scales.
-    limit = 4096 if bits == 8 else 2048
-    return min(limit, triton.next_power_of_2(k))
-
-
 def rwkv7_w8_linear(
     x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
@@ -271,11 +269,12 @@ def rwkv7_w8_linear(
     m, k = x_2d.shape
     n = weight.shape[0]
     out = torch.empty((m, n), dtype=x.dtype, device=x.device)
-    if m >= 512:
+    plan = select_rwkv7_w8_kernel(m, k)
+    if plan.kernel == "w8a8_tiled":
         from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 
         x_quant, x_scale = per_token_quant_int8(x_2d)
-        bm = bn = 128
+        bm, bn = plan.block_m, plan.block_n
         _w8a8_matmul_kernel[(triton.cdiv(m, bm) * triton.cdiv(n, bn),)](
             x_quant,
             weight,
@@ -287,12 +286,12 @@ def rwkv7_w8_linear(
             K=k,
             BM=bm,
             BN=bn,
-            BK=64,
+            BK=plan.block_k,
             GROUP_M=8,
-            num_warps=8,
-            num_stages=3,
+            num_warps=plan.num_warps,
+            num_stages=plan.num_stages,
         )
-    elif m <= 8:
+    elif plan.kernel == "w8_row":
         _w8_row_kernel[(n,)](
             x_2d,
             weight,
@@ -301,19 +300,12 @@ def rwkv7_w8_linear(
             M=m,
             N=n,
             K=k,
-            BM=8,
-            BK=_decode_block_k(k, 8),
-            num_warps=1,
+            BM=plan.block_m,
+            BK=plan.block_k,
+            num_warps=plan.num_warps,
         )
     else:
-        if m <= 32:
-            bm, bn, bk, num_warps = 16, 64, 64, 4
-        elif m <= 128 and k >= 4096:
-            bm, bn, bk, num_warps = 64, 64, 128, 8
-        elif m <= 512:
-            bm, bn, bk, num_warps = 32, 64, 64, 4
-        else:
-            bm, bn, bk, num_warps = 64, 64, 64, 4
+        bm, bn, bk = plan.block_m, plan.block_n, plan.block_k
         _w8_matmul_kernel[(triton.cdiv(m, bm), triton.cdiv(n, bn))](
             x_2d,
             weight,
@@ -325,8 +317,8 @@ def rwkv7_w8_linear(
             BM=bm,
             BN=bn,
             BK=bk,
-            num_warps=num_warps,
-            num_stages=2,
+            num_warps=plan.num_warps,
+            num_stages=plan.num_stages,
         )
     return out.view(*original_shape, n)
 
@@ -338,7 +330,9 @@ def rwkv7_w4_linear(
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     m, k = x_2d.shape
     n = weight.shape[0]
-    if torch.version.hip is not None and m >= 1024:
+    capabilities = rwkv7_kernel_capabilities(torch.version.hip is not None)
+    plan = select_rwkv7_w4_kernel(m, k, capabilities)
+    if plan.kernel == "w4_dequant_mm":
         # On RDNA, large group-scaled W4 tiles are limited by repeated unpack
         # and scale work. Expanding one projection at a time keeps persistent
         # storage packed while allowing rocBLAS to use its tuned fp16 GEMM.
@@ -359,8 +353,7 @@ def rwkv7_w4_linear(
         )
         return torch.mm(x_2d, dequant_weight.t()).view(*original_shape, n)
     out = torch.empty((m, n), dtype=x.dtype, device=x.device)
-    if m <= 8:
-        block_k = _decode_block_k(k, 4)
+    if plan.kernel == "w4_row":
         _w4_row_kernel[(n,)](
             x_2d,
             weight,
@@ -370,13 +363,13 @@ def rwkv7_w4_linear(
             N=n,
             K=k,
             GROUP_SIZE=group_size,
-            BM=8,
-            BK=block_k,
-            num_warps=2 if block_k == 2048 else 1,
+            BM=plan.block_m,
+            BK=plan.block_k,
+            num_warps=plan.num_warps,
         )
     else:
-        bm = 16 if m <= 32 else (64 if m < 128 else 128)
-        _w4_matmul_kernel[(triton.cdiv(m, bm), triton.cdiv(n, 64))](
+        bm, bn = plan.block_m, plan.block_n
+        _w4_matmul_kernel[(triton.cdiv(m, bm), triton.cdiv(n, bn))](
             x_2d,
             weight,
             scale,
@@ -386,10 +379,10 @@ def rwkv7_w4_linear(
             K=k,
             GROUP_SIZE=group_size,
             BM=bm,
-            BN=64,
-            BK=32,
-            num_warps=4 if bm < 128 else 8,
-            num_stages=2,
+            BN=bn,
+            BK=plan.block_k,
+            num_warps=plan.num_warps,
+            num_stages=plan.num_stages,
         )
     return out.view(*original_shape, n)
 
