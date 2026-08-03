@@ -3,13 +3,13 @@
 Date: 2026-07-31
 
 This page records the current Ada optimization slice. It is intentionally
-narrower than the full acceptance contract in `RWKV7_HF_PARITY.md`: complete
+narrower than the full acceptance contract in `RWKV7_ACCEPTANCE.md`: complete
 1.5B and 2.9B dense/W8/W4 batch matrices, production-safe W8/W4 batch-8
 capacity lanes for 7.2B, a 1.5B STANDALONE speculative batch-8 matrix, and one
 RTX 4080. It is an engineering snapshot, not a claim that the multi-hardware
 matrix is complete.
 
-The matched dense/W8/W4 raw JSONL, alignment output, serving-feature output,
+The matched dense/W8/W4 raw JSONL, consistency output, serving-feature output,
 and public environment manifest are stored under
 [`results/2026-07-31/rtx-4080`](results/2026-07-31/rtx-4080/). The earlier
 strict FP32-state evidence remains under `results/2026-07-30/rtx-4080`.
@@ -70,7 +70,7 @@ Albatross 1.5B batch-8 reference, native W8 reaches 1.091x-1.212x prefill and
 about 1.52x decode; native W4 reaches 1.040x-1.150x prefill and about 1.50x
 decode.
 
-The strict quantized alignment gate also passes:
+The strict quantized consistency gate also passes:
 
 | Mode | Max chosen-token logprob error | Mean top-10 overlap | Teacher-forced top-1 agreement |
 | --- | ---: | ---: | ---: |
@@ -105,7 +105,7 @@ continuations. `SGLANG_RWKV7_W4_SHADOW` overrides the automatic choice.
 
 ## Current W4 batch-8 lane (`cbc295c` / `5a2b575`)
 
-| Model | Shadow | Model memory | Prefill tok/s | Decode tok/s | Alignment max / top-10 / top-1 |
+| Model | Shadow | Model memory | Prefill tok/s | Decode tok/s | Consistency max / top-10 / top-1 |
 | --- | --- | ---: | ---: | ---: | ---: |
 | 1.5B | FP16 | 2.63 GB | 26,793-29,485 | 1,530-1,546 | 0.1114 / 0.9680 / 1.0000 |
 | 2.9B | fused INT8 | 4.72 GB | 16,249-17,488 | 850-852 | 0.1763 / 0.9781 / 0.9922 |
@@ -241,7 +241,7 @@ fixed-forward reference in every prefill cell. Against same-runtime
 Qwen3.5-2B, the minima are 1.118x prefill, 1.438x decode, and 1.327x end to
 end; raw decode exceeds the 2.0B/1.5B proportional target of 1.333x.
 
-The strict quant alignment gate passes with 0.1114 maximum chosen-token
+The strict quant consistency gate passes with 0.1114 maximum chosen-token
 logprob error, 0.9680 mean top-10 overlap, and 1.0000 teacher-forced top-1
 agreement. All four 32-token natural-prompt continuations are exact. The
 serving harness also passes full deterministic replay, single-vs-batched
@@ -252,7 +252,7 @@ Model-weight load is 2.63 GB versus 3.03 GB dense, a 13.2% reduction.
 Raw evidence:
 
 - `rwkv7-g1-1.5b/w4-hybrid-safe-th512-862f632.jsonl`
-- `rwkv7-g1-1.5b/w4-hybrid-safe-th512-862f632-alignment.json`
+- `rwkv7-g1-1.5b/w4-hybrid-safe-th512-862f632-consistency.json`
 - `rwkv7-g1-1.5b/w4-hybrid-safe-th512-862f632-serving.json`
 
 ## 2.9B dense/W8/W4 matrix
@@ -268,7 +268,7 @@ lane, every quantized prefill, decode, and end-to-end cell passes:
 
 The reported model-weight memory is 5.68 GB dense, 4.98 GB W8, and 4.28 GB W4
 hybrid. This is a 12.3% W8 and 24.6% W4 reduction. The independent quantized
-alignment gate also passes:
+consistency gate also passes:
 
 | Mode | Max chosen-token logprob error | Mean error | Mean top-10 overlap | Teacher-forced top-1 agreement | Gate |
 | --- | ---: | ---: | ---: | ---: | --- |
@@ -307,19 +307,19 @@ decode. Against the same-runtime Qwen3.5-4B batch-8 baseline, the minima are
 1.417x prefill, 1.650x decode, and 1.615x end to end, exceeding the simple
 4.0B/2.9B active-parameter proportional decode target.
 
-The strict quantized alignment gate passes at 0.2357 maximum chosen-token
+The strict quantized consistency gate passes at 0.2357 maximum chosen-token
 logprob error, 0.9758 mean top-10 overlap, and 0.9766 teacher-forced top-1
 agreement (`0.25 / 0.80 / 0.90`). The production lifecycle harness also passes
 mixed-length compaction, explicit abort, post-abort slot reuse, full cold/warm
 chunked-prefill equality, and a 128-token state-cache hit. Long synthetic
 quantized continuations are not claimed bit-exact: the serving artifact records
 a two-token repeat/duplicate prefix gate, while natural-prompt quality is
-measured by the teacher-forced alignment report.
+measured by the teacher-forced consistency report.
 
 Raw evidence:
 
 - `rwkv7-g1-2.9b/w4-hybrid-safe-d17883f3.jsonl`
-- `rwkv7-g1-2.9b/w4-hybrid-safe-d17883f3-alignment.json`
+- `rwkv7-g1-2.9b/w4-hybrid-safe-d17883f3-consistency.json`
 - `rwkv7-g1-2.9b/w4-hybrid-safe-d17883f3-serving.json`
 
 #### 512-token prefill cutoff update (`97116ffb`)
@@ -327,7 +327,7 @@ Raw evidence:
 The same safety policy was tuned so packed Marlin/native W8 takes over above
 512 tokens rather than above 1,024. This configuration was measured on
 `862f6328` and promoted as the default by `97116ffb`. It retains the 5.00 GB
-model-weight load and the same strict alignment/lifecycle results while
+model-weight load and the same strict consistency/lifecycle results while
 removing the short-prefill regression:
 
 | Prompt | Decode | Prefill tok/s | Decode tok/s | E2E tok/s |
@@ -342,7 +342,7 @@ removing the short-prefill regression:
 Minimum ratios are 1.188x prefill, 1.088x decode, and 1.094x end to end versus
 matched dense; 1.084x prefill and 1.166x decode versus Albatross; and 1.485x
 prefill, 1.636x decode, and 1.613x end to end versus Qwen3.5-4B. Raw decode
-therefore clears the 4.0B/2.9B proportional target of 1.379x. The alignment
+therefore clears the 4.0B/2.9B proportional target of 1.379x. The consistency
 gate remains at 0.2357 maximum logprob error, 0.9758 top-10 overlap, and 0.9766
 top-1 agreement. The two-token synthetic repeat-prefix disclosure remains
 unchanged; all cache, compaction, abort, and slot-reuse lifecycle gates pass.
@@ -350,7 +350,7 @@ unchanged; all cache, compaction, abort, and slot-reuse lifecycle gates pass.
 Raw evidence:
 
 - `rwkv7-g1-2.9b/w4-hybrid-safe-th512-862f632.jsonl`
-- `rwkv7-g1-2.9b/w4-hybrid-safe-th512-862f632-alignment.json`
+- `rwkv7-g1-2.9b/w4-hybrid-safe-th512-862f632-consistency.json`
 - `rwkv7-g1-2.9b/w4-hybrid-safe-th512-862f632-serving.json`
 
 ## 7.2B quantized capacity lane
@@ -383,7 +383,7 @@ uses two warm-ups and the median of five clean samples.
 | 2048 | 128 | W8 accuracy, FP32 state | 6,287.0 | 378.4 | 193.5 |
 | 2048 | 512 | W8 accuracy, FP32 state | 6,280.6 | 378.3 | 305.4 |
 
-W4 passes the strict alignment gate with 0.1527 maximum chosen-token logprob
+W4 passes the strict consistency gate with 0.1527 maximum chosen-token logprob
 error, 0.9688 mean top-10 overlap, and 0.9844 teacher-forced top-1 agreement.
 All four natural-prompt continuations reproduce the dense 32-token reference.
 Its serving report passes dynamic-batch isolation, cold/warm chunked prefill,
@@ -400,10 +400,10 @@ repeat-prefix gate.
 Raw evidence:
 
 - `rwkv7-g1-7.2b/w4-hybrid-safe-th512-8fa6e43.jsonl`
-- `rwkv7-g1-7.2b/w4-hybrid-safe-th512-8fa6e43-alignment.json`
+- `rwkv7-g1-7.2b/w4-hybrid-safe-th512-8fa6e43-consistency.json`
 - `rwkv7-g1-7.2b/w4-hybrid-safe-th512-8fa6e43-serving.json`
 - `rwkv7-g1-7.2b/w8-accuracy-fp32-th512-8fa6e43.jsonl`
-- `rwkv7-g1-7.2b/w8-accuracy-fp32-th512-8fa6e43-alignment.json`
+- `rwkv7-g1-7.2b/w8-accuracy-fp32-th512-8fa6e43-consistency.json`
 - `rwkv7-g1-7.2b/w8-accuracy-fp32-th512-8fa6e43-serving.json`
 
 ## Prior strict FP32-state W8 lane
@@ -428,9 +428,9 @@ Against the same FP32-state dense reference, W8 is faster in all six prefill,
 decode, and end-to-end cells. FP32-state prefill remains slower than the
 separate FP16-state performance lane, as expected.
 
-## Quantized alignment
+## Quantized consistency
 
-The alignment harness generates a dense Hugging Face continuation and then
+The consistency harness generates a dense reference continuation and then
 teacher-forces the same continuation through quantized SGLang. This avoids
 misreporting every token after one early free-running branch as an independent
 quantization error.

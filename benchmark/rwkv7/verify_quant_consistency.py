@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Measure quantized SGLang logits on a fixed dense-HF continuation.
+"""Measure quantized SGLang logits on a fixed dense reference continuation.
 
 Free-running greedy sequences are a poor quantization metric: one early token
 change puts the two implementations on different contexts. This harness first
-generates a continuation with the dense Hugging Face model, then asks the
+generates a continuation with an independent dense model, then asks the
 already-running SGLang server to score that exact continuation. It reports
 chosen-token log-probability error, top-k overlap, and teacher-forced top-1
 agreement without hiding the free-running matching-prefix diagnostic.
@@ -53,12 +53,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reference-input",
         type=Path,
-        help="Reuse a dense-HF reference generated in a separate process.",
+        help="Reuse a dense reference generated in a separate process.",
     )
     parser.add_argument(
         "--reference-output",
         type=Path,
-        help="Persist the dense-HF continuation and logits for later scoring.",
+        help="Persist the dense reference continuation and logits for later scoring.",
     )
     parser.add_argument(
         "--reference-only",
@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def load_hf_model(model_path: str, dtype: torch.dtype):
+def load_reference_model(model_path: str, dtype: torch.dtype):
     kwargs = {"trust_remote_code": True, "dtype": dtype}
     try:
         return AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
@@ -87,7 +87,7 @@ def load_hf_model(model_path: str, dtype: torch.dtype):
 def build_references(args: argparse.Namespace) -> list[Reference]:
     dtype = getattr(torch, args.dtype)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    model = load_hf_model(args.model, dtype).cuda().eval()
+    model = load_reference_model(args.model, dtype).cuda().eval()
     references = []
     for prompt in args.prompts or DEFAULT_PROMPTS:
         encoded = tokenizer(prompt, return_tensors="pt")
@@ -305,7 +305,7 @@ def main() -> None:
         and summary["teacher_forced_top1_agreement"] >= args.min_top1_agreement
     )
     report = {
-        "schema": "rwkv7-quant-alignment-v1",
+        "schema": "rwkv7-quant-consistency-v1",
         "model": args.model,
         "dtype": args.dtype,
         "max_new_tokens": args.max_new_tokens,

@@ -13,14 +13,13 @@
 --------------------------------------------------------------------------------
 
 > **RWKV-7 distribution.** This repository maintains a production-oriented
-> RWKV-7 serving path on top of SGLang. The
-> [RWKV-7 Hugging Face adapter](https://github.com/rwkv-rs/hf-adapter) defines
-> the checkpoint, correctness, workload, metric, and hardware acceptance
-> standard. Speed is accepted against matched Qwen3.5 and Albatross baselines,
-> not against the Hugging Face runtime itself. SGLang must additionally retain
+> RWKV-7 serving path on top of SGLang. Correctness, workload, metrics, and
+> hardware coverage are defined and maintained inside this repository. Speed
+> is accepted against matched Qwen3.5 and Albatross baselines. SGLang must
+> additionally retain
 > continuous batching, recurrent radix caching, chunked prefill, distributed
 > execution, and speculative decoding. See the
-> [RWKV-7 acceptance contract](RWKV7_HF_PARITY.md) and
+> [RWKV-7 acceptance contract](RWKV7_ACCEPTANCE.md) and
 > [RWKV-7 serving benchmark](benchmark/rwkv7/README.md). The current measured
 > Ada slice is published separately as the
 > [RTX 4080 engineering snapshot](benchmark/rwkv7/RESULTS_4080.md), including

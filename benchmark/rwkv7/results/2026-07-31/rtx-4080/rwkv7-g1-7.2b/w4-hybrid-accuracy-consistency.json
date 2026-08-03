@@ -1,6 +1,6 @@
 {
-  "schema": "rwkv7-quant-alignment-v1",
-  "model": "/home/wzu/.private/rwkv7-hf-4080/models/rwkv7-g1h-7.2b-hf-converted",
+  "schema": "rwkv7-quant-consistency-v1",
+  "model": "<checkpoint-root>/rwkv7-g1h-7.2b-checkpoint",
   "dtype": "float16",
   "max_new_tokens": 32,
   "top_k": 10,

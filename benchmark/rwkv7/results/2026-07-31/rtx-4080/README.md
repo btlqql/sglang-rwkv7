@@ -11,20 +11,20 @@ and active batch sizes 1/2/4/8. Every cell flushes the recurrent radix cache,
 runs two warm-ups, and reports the median of five samples. Batch 1/2/4 uses the
 exact aggregate-token graph buckets 128/256/512/1024/2048/4096/8192/16384;
 the earlier batch-8 files already use exact 1024/4096/16384 buckets. Dense, W8,
-and W4 alignment reports are included; the W4 directory also includes the
+and W4 consistency reports are included; the W4 directory also includes the
 serving-feature gate.
 
 For 1.5B, W8 is at least 1.048x/1.053x/1.054x dense for prefill/decode/E2E;
 W4 is at least 1.023x/1.139x/1.127x. For 2.9B, those minima are
-1.091x/1.094x/1.094x and 1.087x/1.231x/1.179x. Quantized alignment passes for
+1.091x/1.094x/1.094x and 1.087x/1.231x/1.179x. Quantized consistency passes for
 both models. Production-safe 7.2B W4 and W8 batch-8 capacity lanes now also
-pass alignment and serving-lifecycle gates. Fresh same-runtime Qwen3.5 and full
+pass consistency and serving-lifecycle gates. Fresh same-runtime Qwen3.5 and full
 Albatross artifacts retain the remaining red cells. These measurements still
 represent one GPU rather than the full multi-hardware acceptance matrix.
 
 The first matrix command accidentally supplied the Albatross commit in the
-`standard_sha` field. The checked-in JSONL corrects that metadata to the pinned
-HF acceptance commit from `environment.json`; numeric measurements, samples,
+`contract_revision` field. The checked-in JSONL corrects that metadata to the pinned
+repository acceptance commit from `environment.json`; numeric measurements, samples,
 model code SHA, and baseline files are unchanged.
 
 ## Width-specialized W4 shadow update
@@ -51,13 +51,13 @@ Fresh batch-8 results use two warm-ups and the median of five samples:
 The 1.5B matrix remains at least 1.142x/1.066x/1.070x matched dense for
 prefill/decode/end-to-end and 1.123x/1.444x/1.335x same-runtime Qwen3.5-2B.
 Relative to Albatross, decode is 1.254x-1.267x and prefill is within
--0.80%/+0.85%. Its alignment gate passes at 0.1114 maximum chosen-token
+-0.80%/+0.85%. Its consistency gate passes at 0.1114 maximum chosen-token
 logprob error, 0.9680 mean top-10 overlap, and 1.0000 teacher-forced top-1
 agreement.
 
 The 2.9B matrix is at least 1.187x/1.133x/1.137x matched dense,
 1.484x/1.704x/1.648x Qwen3.5-4B, and 1.083x/1.214x Albatross for
-prefill/decode. Its alignment gate passes at 0.1763 maximum error, 0.9781
+prefill/decode. Its consistency gate passes at 0.1763 maximum error, 0.9781
 top-10 overlap, and 0.9922 teacher-forced top-1 agreement.
 
 The 1.5B and 2.9B serving reports deliberately retain a two-token synthetic
@@ -66,7 +66,7 @@ generation. Both pass exact cold/warm chunked-prefill output, a 128-token state
 cache hit, dynamic-batch duplicate isolation, mixed-length compaction, abort,
 and post-abort state reuse. The 7.2B report passes the complete 32-token
 deterministic gate, exact single-vs-batch output, cache restore, and the full
-lifecycle checks. Its alignment report has 0.0949 maximum error, 0.9711 top-10
+lifecycle checks. Its consistency report has 0.0949 maximum error, 0.9711 top-10
 overlap, 1.0000 top-1 agreement, and four exact natural-prompt continuations.
 
 The compact 7.2B layout also frees enough memory to capture the complete
@@ -88,7 +88,7 @@ lane after the earlier high-compression policy exposed batch-layout-sensitive
 long greedy continuations. Its committed batch-8 evidence covers all six
 128/512/2048 prefill by 128/512 decode cells. Minimum gains over matched dense
 are 1.118x prefill, 1.099x decode, and 1.101x end to end; model-weight memory is
-5.00 GB versus 5.68 GB dense. It also passes the strict quant alignment gate,
+5.00 GB versus 5.68 GB dense. It also passes the strict quant consistency gate,
 full cold/warm chunked-prefill equality, state-cache hit, mixed-length
 compaction, abort, and post-abort slot-reuse checks. See the three
 `rwkv7-g1-2.9b/w4-hybrid-safe-d17883f3*` artifacts. The serving report
@@ -104,14 +104,14 @@ as the default by `97116ffb`. New batch-8 artifacts are named
 For 1.5B, minimum ratios are 1.134x/1.062x/1.065x versus matched dense for
 prefill/decode/end-to-end, 0.994x prefill and 1.249x decode versus Albatross,
 and 1.118x/1.438x/1.327x versus Qwen3.5-2B. The model load is 2.63 GB versus
-3.03 GB dense. Its strict alignment report reproduces all four natural-prompt
+3.03 GB dense. Its strict consistency report reproduces all four natural-prompt
 continuations exactly, and its serving report passes the complete repeat,
 batching, cache, compaction, abort, and slot-reuse lifecycle gate.
 
 For 2.9B, minimum ratios are 1.188x/1.088x/1.094x versus matched dense,
 1.084x prefill and 1.166x decode versus Albatross, and
 1.485x/1.636x/1.613x versus Qwen3.5-4B. Model load remains 5.00 GB versus
-5.68 GB dense. Strict teacher-forced alignment and all production lifecycle
+5.68 GB dense. Strict teacher-forced consistency and all production lifecycle
 checks pass; its serving artifact retains the explicit two-token synthetic
 repeat-prefix disclosure.
 
@@ -126,7 +126,7 @@ eager prefill because a 16,384-token graph exceeds the 16 GB budget by about
 
 W4 loads at 11.58 GB and sustains 392.8-393.2 decode tok/s. W8 with strict FP32
 recurrent state loads at 11.56 GB and sustains 377.9-378.4 decode tok/s. Both
-alignment reports pass. W4 reproduces all four natural 32-token references;
+consistency reports pass. W4 reproduces all four natural 32-token references;
 W8 reaches 1.0000 teacher-forced top-1 agreement. Both pass cache restore,
 dynamic batching, compaction, abort, and post-abort slot reuse; W8 additionally
 passes the complete deterministic synthetic serving gate.

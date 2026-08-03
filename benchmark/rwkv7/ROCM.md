@@ -33,11 +33,11 @@ The helper defaults to the portable Triton backend and decode graphs through
 batch size 8:
 
 ```bash
-benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-hf dense
-benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-hf w8
-benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-hf w4
-benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-hf native-w8
-benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-hf native-w4
+benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-checkpoint dense
+benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-checkpoint w8
+benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-checkpoint w4
+benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-checkpoint native-w8
+benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-checkpoint native-w4
 ```
 
 Additional SGLang arguments can follow the mode.  PyTorch retains the CUDA API
@@ -49,7 +49,7 @@ smaller budget for a lower-memory card or a larger checkpoint:
 
 ```bash
 SGLANG_RWKV7_ROCM_CHUNKED_PREFILL_SIZE=2048 \
-  benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-hf native-w8
+  benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-checkpoint native-w8
 ```
 
 The helper uses `python` from `PATH`.  Set `SGLANG_PYTHON` when SGLang is in a
@@ -57,7 +57,7 @@ dedicated environment that is not activated in the current shell:
 
 ```bash
 SGLANG_PYTHON=/opt/venv/bin/python \
-  benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-hf dense
+  benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-checkpoint dense
 ```
 
 The native modes default recurrent state to FP16 so the packed-varlen HIP WKV
@@ -66,7 +66,7 @@ required:
 
 ```bash
 SGLANG_RWKV7_SSM_DTYPE=float32 \
-  benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-hf native-w8
+  benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-checkpoint native-w8
 ```
 
 The script disables AITER by default because consumer RDNA wheels may omit the
@@ -74,7 +74,7 @@ required GEMM modules.  A complete CDNA installation can opt back in:
 
 ```bash
 SGLANG_USE_AITER=1 USE_ROCM_AITER_ROPE_BACKEND=1 \
-  benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-hf dense
+  benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-checkpoint dense
 ```
 
 ## Validation
@@ -85,8 +85,8 @@ Run these against the server:
 python benchmark/rwkv7/verify_serving_features.py \
   --base-url http://127.0.0.1:30000 --max-new-tokens 24
 
-python benchmark/rwkv7/verify_quant_alignment.py \
-  --model /path/to/rwkv7-hf \
+python benchmark/rwkv7/verify_quant_consistency.py \
+  --model /path/to/rwkv7-checkpoint \
   --base-url http://127.0.0.1:30000 \
   --dtype float16 --max-new-tokens 24 --top-k 10
 
@@ -98,8 +98,8 @@ python benchmark/rwkv7/bench_acceptance_matrix.py \
 
 The dense correctness run covered 0.4B, 1.5B, and 2.9B checkpoints.  The 0.4B
 and 2.9B models passed the complete serving-feature gate, including an exact
-128-token state-cache continuation.  The 1.5B model passed HF teacher-forced
-alignment, with maximum token log-probability error 0.0082 and top-1 agreement
+128-token state-cache continuation.  The 1.5B model passed reference teacher-forced
+consistency, with maximum token log-probability error 0.0082 and top-1 agreement
 1.0.  Its synthetic cache prompt has a near-tied third-token argmax: cold and
 cached logits differ by normal low-precision reduction noise before the two
 greedy sequences diverge, so that one strict token-exact fixture remains a
@@ -132,7 +132,7 @@ transformer MLP.  `SGLANG_RWKV7_BNB_POLICY` therefore exposes three policies:
 - `balanced`: quantizes both FFN projections;
 - `speed`: quantizes all large attention and FFN projections.
 
-The 1.5B accuracy lanes passed the quant alignment gate:
+The 1.5B accuracy lanes passed the quant consistency gate:
 
 | Mode | Max logprob error | Mean top-10 overlap | Top-1 agreement | B1 decode | B8 decode |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -195,7 +195,7 @@ versus 691.9-693.6 tok/s for dense: both quantized paths were about 1.10x dense
 in every decode cell. Loaded weight memory fell from 2.86 GB to 2.42 GB for W8
 and 2.40 GB for W4.
 
-The strict quantized alignment gates passed. W8 reported maximum chosen-token
+The strict quantized consistency gates passed. W8 reported maximum chosen-token
 log-probability error 0.0784, mean top-10 overlap 0.9813, and top-1 agreement
 1.0000. W4 reported 0.1486, 0.9633, and 0.9922 respectively. Dynamic batching,
 chunked-prefill cold/warm matching, state-cache hits, mixed-length compaction,

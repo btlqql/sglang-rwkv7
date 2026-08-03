@@ -1,6 +1,6 @@
 {
-  "schema": "rwkv7-quant-alignment-v1",
-  "model": "/home/wzu/.private/rwkv7-hf-4080/models/rwkv7-g1g-1.5b-hf",
+  "schema": "rwkv7-quant-consistency-v1",
+  "model": "rwkv7-g1h-7.2b-checkpoint",
   "dtype": "float16",
   "max_new_tokens": 32,
   "top_k": 10,
@@ -11,8 +11,8 @@
   },
   "passed": true,
   "summary": {
-    "max_token_logprob_error": 0.10116112232208252,
-    "mean_token_logprob_error": 0.01658786077003427,
+    "max_token_logprob_error": 0.11125218868255615,
+    "mean_token_logprob_error": 0.018683181872432897,
     "mean_top_k_overlap": 0.9625,
     "teacher_forced_top1_agreement": 1.0
   },
@@ -20,9 +20,9 @@
     {
       "prompt": "The capital of France is",
       "tokens": 32,
-      "max_token_logprob_error": 0.09388124942779541,
-      "mean_token_logprob_error": 0.008290556266274507,
-      "mean_top_k_overlap": 0.965625,
+      "max_token_logprob_error": 0.11125218868255615,
+      "mean_token_logprob_error": 0.015707390168245183,
+      "mean_top_k_overlap": 0.95625,
       "teacher_forced_top1_agreement": 1.0,
       "free_running_matching_prefix": 32,
       "free_running_exact": true
@@ -30,9 +30,9 @@
     {
       "prompt": "1 + 2 + 3 + 4 + 5 =",
       "tokens": 32,
-      "max_token_logprob_error": 0.10116112232208252,
-      "mean_token_logprob_error": 0.021539048476370226,
-      "mean_top_k_overlap": 0.971875,
+      "max_token_logprob_error": 0.09963500499725342,
+      "mean_token_logprob_error": 0.01816399633207766,
+      "mean_top_k_overlap": 0.96875,
       "teacher_forced_top1_agreement": 1.0,
       "free_running_matching_prefix": 32,
       "free_running_exact": true
@@ -40,22 +40,22 @@
     {
       "prompt": "Once upon a time, in a small village by the sea,",
       "tokens": 32,
-      "max_token_logprob_error": 0.0941665768623352,
-      "mean_token_logprob_error": 0.024901296877786194,
+      "max_token_logprob_error": 0.09929442405700684,
+      "mean_token_logprob_error": 0.02656872277327693,
       "mean_top_k_overlap": 0.96875,
       "teacher_forced_top1_agreement": 1.0,
-      "free_running_matching_prefix": 32,
-      "free_running_exact": true
+      "free_running_matching_prefix": 24,
+      "free_running_exact": false
     },
     {
       "prompt": "The quick brown fox",
       "tokens": 32,
-      "max_token_logprob_error": 0.07012367248535156,
-      "mean_token_logprob_error": 0.011620541459706146,
-      "mean_top_k_overlap": 0.94375,
+      "max_token_logprob_error": 0.06757596135139465,
+      "mean_token_logprob_error": 0.014292618216131814,
+      "mean_top_k_overlap": 0.95625,
       "teacher_forced_top1_agreement": 1.0,
-      "free_running_matching_prefix": 32,
-      "free_running_exact": true
+      "free_running_matching_prefix": 10,
+      "free_running_exact": false
     }
   ]
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the HF-standard RWKV-7 serving workload and emit JSONL evidence.
+"""Run the repository-standard RWKV-7 serving workload and emit JSONL evidence.
 
 The client uses SGLang's streaming endpoint so prefill/TTFT and steady-state
 decode can be measured separately. A batch is considered ready when every
@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu", default="unknown")
     parser.add_argument("--implementation", default="sglang-rwkv7")
     parser.add_argument("--repo-sha", default="unknown")
-    parser.add_argument("--standard-sha", default="unknown")
+    parser.add_argument("--contract-revision", default="rwkv7-acceptance-v1")
     parser.add_argument("--no-flush-cache", action="store_true")
     return parser.parse_args()
 
@@ -168,7 +168,7 @@ def main() -> None:
                     "mode": args.mode,
                     "gpu": args.gpu,
                     "repo_sha": args.repo_sha,
-                    "standard_sha": args.standard_sha,
+                    "contract_revision": args.contract_revision,
                     "batch_size": batch_size,
                     "prompt_tokens_per_request": input_len,
                     "decode_tokens_per_request": output_len,

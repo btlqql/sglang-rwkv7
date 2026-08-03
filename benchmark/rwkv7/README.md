@@ -3,7 +3,7 @@
 This directory contains the reproducible correctness, serving-feature, and
 performance harnesses for native RWKV-7 in SGLang.
 
-- Acceptance contract: [`RWKV7_HF_PARITY.md`](../../RWKV7_HF_PARITY.md)
+- Acceptance contract: [`RWKV7_ACCEPTANCE.md`](../../RWKV7_ACCEPTANCE.md)
 - Current RTX 4080 snapshot: [`RESULTS_4080.md`](RESULTS_4080.md)
 - Current gfx1100 ROCm snapshot:
   [`results/2026-08-03/gfx1100/`](results/2026-08-03/gfx1100/)
@@ -27,7 +27,7 @@ portable fallback and add boundary-selection plus numerical tests. A device is
 promoted only after the full acceptance matrix passes on that device; an
 untested architecture must not inherit a performance claim from a related GPU.
 
-## HF-standard batch matrix
+## Repository-standard batch matrix
 
 `bench_acceptance_matrix.py` drives the streaming API and records TTFT, prefill
 throughput, TPOT, decode throughput, end-to-end output throughput, raw samples,
@@ -39,7 +39,7 @@ python benchmark/rwkv7/bench_acceptance_matrix.py \
   --mode dense-fp16 \
   --gpu 'NVIDIA GeForce RTX 4080' \
   --repo-sha "$(git rev-parse HEAD)" \
-  --standard-sha f1b49bc52a050d09a6739bc4859850f5dc50e7ef \
+  --contract-revision rwkv7-acceptance-v1 \
   --batch-sizes 1,2,4,8 \
   --prompt-lengths 128,512,2048 \
   --decode-lengths 128,512 \
@@ -104,7 +104,7 @@ The strict state-cache lane keeps recurrent state in FP32:
 
 ```bash
 python -m sglang.launch_server \
-  --model-path /path/to/rwkv7-hf \
+  --model-path /path/to/rwkv7-checkpoint \
   --trust-remote-code \
   --attention-backend triton \
   --dtype float16 \
@@ -118,11 +118,11 @@ python -m sglang.launch_server \
 ```
 
 The prefill capture list is the set of distinct aggregate token counts in the
-HF matrix (`batch_size * prompt_length`). Omitting the 128/256/512/2048/8192
-buckets pads several bsz 1/2/4 cells into a larger graph and can nearly halve
-reported throughput. Full-prefill graphs are currently an explicit fixed-shape
-performance lane; dynamic shapes, chunked requests, and uncaptured sizes retain
-their normal fallback paths.
+acceptance matrix (`batch_size * prompt_length`). Omitting the
+128/256/512/2048/8192 buckets pads several bsz 1/2/4 cells into a larger graph
+and can nearly halve reported throughput. Full-prefill graphs are currently an
+explicit fixed-shape performance lane; dynamic shapes, chunked requests, and
+uncaptured sizes retain their normal fallback paths.
 
 `--mamba-ssm-dtype float16` selects the Ada FP16-state performance lane and its
 optional native packed-varlen CUDA WKV kernel. It lowers state memory and raises
@@ -160,7 +160,7 @@ weight-quantized. Legacy W8A8/Marlin keep `lm_head` dense; the native
 ```bash
 SGLANG_RWKV7_W8_POLICY=accuracy \
 python -m sglang.launch_server \
-  --model-path /path/to/rwkv7-hf \
+  --model-path /path/to/rwkv7-checkpoint \
   --trust-remote-code \
   --attention-backend triton \
   --dtype float16 \
@@ -180,7 +180,7 @@ required for the strict cold/warm cache-continuation gate in the current build.
 ```bash
 SGLANG_RWKV7_W4_POLICY=accuracy \
 python -m sglang.launch_server \
-  --model-path /path/to/rwkv7-hf \
+  --model-path /path/to/rwkv7-checkpoint \
   --trust-remote-code \
   --attention-backend triton \
   --dtype float16 \
@@ -210,20 +210,20 @@ compression lane. It keeps recurrent attention and FFN contraction weights
 dense, preserving the zero-skipping SqReLU contraction kernel, and applies W4
 only to a calibrated subset of interior FFN expansion layers. Edge layers and
 the later secondary lane remain dense for accuracy. Use this policy only after
-running both `verify_serving_features.py` and `verify_quant_alignment.py` on
+running both `verify_serving_features.py` and `verify_quant_consistency.py` on
 the target checkpoint; the selected layers scale with model depth, so evidence
 from one size is not evidence for every size.
 
-## Quantized alignment
+## Quantized consistency
 
-`verify_quant_alignment.py` generates a continuation with dense Hugging Face,
+`verify_quant_consistency.py` generates a continuation with dense reference,
 then teacher-forces that exact continuation through an already-running
 quantized SGLang server. It reports chosen-token logprob error, top-k overlap,
 teacher-forced top-1 agreement, and a free-running prefix diagnostic.
 
 ```bash
-python benchmark/rwkv7/verify_quant_alignment.py \
-  --model /path/to/rwkv7-hf \
+python benchmark/rwkv7/verify_quant_consistency.py \
+  --model /path/to/rwkv7-checkpoint \
   --base-url http://127.0.0.1:30000 \
   --dtype float16 \
   --max-new-tokens 32 \
@@ -239,15 +239,15 @@ For a model whose dense reference and quantized server do not fit on one GPU,
 split reference generation and scoring into fresh processes:
 
 ```bash
-# Dense server is stopped; only the HF model occupies the GPU.
-python benchmark/rwkv7/verify_quant_alignment.py \
-  --model /path/to/rwkv7-hf \
+# Dense server is stopped; only the reference model occupies the GPU.
+python benchmark/rwkv7/verify_quant_consistency.py \
+  --model /path/to/rwkv7-checkpoint \
   --reference-only \
   --reference-output /tmp/rwkv7-7.2b-reference.json
 
-# Dense HF memory is released; start the quantized SGLang server, then score.
-python benchmark/rwkv7/verify_quant_alignment.py \
-  --model /path/to/rwkv7-hf \
+# Dense reference memory is released; start the quantized SGLang server, then score.
+python benchmark/rwkv7/verify_quant_consistency.py \
+  --model /path/to/rwkv7-checkpoint \
   --reference-input /tmp/rwkv7-7.2b-reference.json \
   --base-url http://127.0.0.1:30000
 ```
@@ -278,7 +278,7 @@ and fused RWKV elementwise kernels continue to use Triton:
 
 ```bash
 python -m sglang.launch_server \
-  --model-path /path/to/rwkv7-hf \
+  --model-path /path/to/rwkv7-checkpoint \
   --trust-remote-code \
   --dtype float16 \
   --attention-backend triton \
@@ -291,8 +291,8 @@ python -m sglang.launch_server \
 ```
 
 The same command accepts `--tp-size 2` or `--pp-size 2` when two devices are
-available. A two-card V100-32GB validation with a native
-`rwkv7-hf-adapter` checkpoint covered the following matrix:
+available. A two-card V100-32GB validation with a standard RWKV-7 checkpoint
+covered the following matrix:
 
 | Configuration | Greedy tokens vs. TP1 | Dynamic batch isolation | 64-token chunked prefill | 128-token state-cache hit |
 | --- | --- | --- | --- | --- |
@@ -343,18 +343,18 @@ architectures when throughput is the acceptance criterion.
 For AMD/ROCm installation, launch commands, correctness evidence, and measured
 RDNA performance, see [ROCM.md](ROCM.md).
 
-## Hugging Face alignment
+## Reference consistency
 
-For native `rwkv-rs/hf-adapter` checkpoints, the alignment harness first runs
-Hugging Face generation, releases that model, starts SGLang, and then compares:
+The consistency harness first runs an independent dense reference, releases
+that model, starts SGLang, and then compares:
 
 - greedy output token IDs;
 - generated-token log probabilities;
 - top-k token-set overlap at each matched decode step.
 
 ```bash
-python benchmark/rwkv7/verify_hf_alignment.py \
-  --model /path/to/rwkv7-hf \
+python benchmark/rwkv7/verify_reference_consistency.py \
+  --model /path/to/rwkv7-checkpoint \
   --dtype float16 \
   --max-new-tokens 16 \
   --top-k 10

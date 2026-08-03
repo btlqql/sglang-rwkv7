@@ -7,7 +7,7 @@ RWKV-7 native quantization kernels.
 
 - `*-b8.jsonl`: two warm-ups and median-of-five serving measurements for
   128/512/2048 prompt tokens per request and 128 generated tokens;
-- `*-alignment.json`: independent dense-HF teacher-forced quantization gate;
+- `*-consistency.json`: independent dense reference teacher-forced quantization gate;
 - `*-serving.json`: dynamic batching, chunked prefill, recurrent cache and
   request-lifecycle checks;
 - `model-memory.jsonl`: model-weight memory reported by the server loader;

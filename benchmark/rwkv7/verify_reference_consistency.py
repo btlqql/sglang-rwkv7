@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare native Hugging Face RWKV-7 generation with the SGLang model path."""
+"""Compare an independent dense RWKV-7 reference with SGLang serving."""
 
 import argparse
 import gc
@@ -41,7 +41,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_hf_model(model_path, dtype):
+def load_reference_model(model_path, dtype):
     kwargs = {"trust_remote_code": True, "dtype": dtype}
     try:
         return AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
@@ -52,7 +52,7 @@ def load_hf_model(model_path, dtype):
 
 
 def build_references(args, tokenizer, dtype):
-    model = load_hf_model(args.model, dtype).cuda().eval()
+    model = load_reference_model(args.model, dtype).cuda().eval()
     results = []
     for prompt in args.prompts or DEFAULT_PROMPTS:
         encoded = tokenizer(prompt, return_tensors="pt")
@@ -119,8 +119,8 @@ def compare_one(args, base_url, reference):
     ]
 
     prefix = 0
-    for hf_token, server_token in zip(reference.output_ids, server_ids):
-        if hf_token != server_token:
+    for reference_token, server_token in zip(reference.output_ids, server_ids):
+        if reference_token != server_token:
             break
         prefix += 1
 
@@ -157,9 +157,9 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     references = build_references(args, tokenizer, dtype)
 
-    # Import SGLang only after the native HF reference has been constructed.
+    # Import SGLang only after the independent reference has been constructed.
     # SGLang registers its optimized rwkv7_native config globally; importing it
-    # first would intentionally replace the remote HF config class and make
+    # first would intentionally replace the remote config class and make
     # AutoModel's remote-code consistency check reject the reference model.
     from sglang.srt.utils import kill_process_tree
     from sglang.test.test_utils import popen_launch_server
