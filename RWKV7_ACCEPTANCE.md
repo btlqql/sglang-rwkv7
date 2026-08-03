@@ -1,50 +1,45 @@
 # RWKV-7 SGLang acceptance contract
 
-This document is the performance contract for the RWKV-7 implementation in
-this repository. The Hugging Face adapter supplies the standard: checkpoint
-conversion, correctness tolerances, workload cells, metrics, quantization
-policy, and hardware coverage. It is not the speed baseline. SGLang speed is
-accepted against matched Qwen3.5 and Albatross runs while retaining SGLang's
-serving capabilities.
+This document is the repository-owned performance and correctness contract for
+the RWKV-7 implementation. It defines checkpoint requirements, numerical
+tolerances, workload cells, metrics, quantization policy, and hardware
+coverage. SGLang speed is accepted against matched Qwen3.5 and Albatross runs
+while retaining SGLang's serving capabilities.
 
-## Reference standard and speed baselines
+## Reference procedure and speed baselines
 
-- Acceptance-standard repository: <https://github.com/rwkv-rs/hf-adapter>
-- Initial pinned acceptance-standard commit:
-  [`f1b49bc52a050d09a6739bc4859850f5dc50e7ef`](https://github.com/rwkv-rs/hf-adapter/commit/f1b49bc52a050d09a6739bc4859850f5dc50e7ef)
-- Checkpoint, tokenizer, prompt tokens, generated-token count, dtype, device,
-  warm-up count, measurement count, and synchronization policy must follow the
-  pinned HF acceptance definition.
-- A newer HF commit may replace the pin only when the benchmark result records
-  the exact new SHA and all affected baselines are rerun.
+- The acceptance procedure is versioned with this repository.
+- Every result records the repository revision, checkpoint identifier and hash,
+  tokenizer revision, prompt tokens, generated-token count, dtype, device,
+  warm-up count, measurement count, and synchronization policy.
+- A contract change requires rerunning every affected baseline. Historical
+  results remain attached to the revision that produced them.
 
 The speed baselines are:
 
-1. **Qwen3.5:** the parameter/active-work pair declared by the HF acceptance
-   scripts (for example RWKV-7 1.5B against Qwen3.5 2B). This is the primary
+1. **Qwen3.5:** the parameter/active-work pair declared by this contract (for
+   example RWKV-7 1.5B against Qwen3.5 2B). This is the primary
    cross-architecture prefill and decode gate.
 2. **Albatross:** the same RWKV-7 checkpoint, dtype, batch, prompt, decode, and
    device. This is the primary same-model implementation gate.
 
-HF runtime measurements may be retained as diagnostic telemetry. They do not
-decide whether the SGLang speed target passes.
+Reference-runtime measurements may be retained as diagnostic telemetry. They
+do not decide whether the SGLang speed target passes. Training frameworks are
+outside this serving repository's scope; supported standard checkpoints must
+load directly and produce numerically consistent inference results.
 
-HF training implementations such as Trainer, PEFT, TRL, and DeepSpeed are not
-embedded into SGLang. Their output checkpoints must load directly and produce
-aligned inference results.
+## Definition of complete acceptance
 
-## Definition of complete parity
+Acceptance is complete only when all of the following are true:
 
-Parity is complete only when all of the following are true:
-
-1. Every applicable HF inference optimization has an equivalent SGLang path or
-   a measured SGLang-native replacement.
+1. Every promoted optimization has a measured SGLang-native path and a safe
+   fallback.
 2. Every required benchmark cell contains a real result. Unsupported, missing,
    skipped, estimated, and microbenchmark-only cells do not pass.
 3. Dense FP16/BF16 prefill, decode, and end-to-end serving pass the matched
    Qwen3.5 gate and meet or exceed Albatross on the same card.
 4. W8 and W4 reduce memory and are no slower than the SGLang dense reference;
-   quantized correctness follows the HF acceptance tolerances.
+   quantized correctness follows the tolerances defined below.
 5. Correctness, dynamic batching, chunked prefill, recurrent state caching,
    CUDA Graphs, TP/PP, and speculative decoding remain valid.
 6. Card-specific promotion never regresses already-supported cards or the
@@ -52,9 +47,9 @@ Parity is complete only when all of the following are true:
 
 ## Optimization inventory
 
-| HF performance surface | SGLang requirement | Current state |
+| Performance surface | SGLang requirement | Current state |
 | --- | --- | --- |
-| `native_jit` / `native_graph` token decode | Use SGLang CUDA Graph runners with static state-pool addressing and no per-token host synchronization | Implemented for supported fixed decode buckets; parity matrix open |
+| `native_jit` / `native_graph` token decode | Use SGLang CUDA Graph runners with static state-pool addressing and no per-token host synchronization | Implemented for supported fixed decode buckets; acceptance matrix open |
 | Fused decode norm and time-mix | Fuse safe normalization, shift-mix, low-rank controls, and state preparation around the serving tensor layout | Partial |
 | Fused recurrent update and output preparation | Join WKV state update/readout with normalization, correction, gate, and output preparation when end-to-end profiling proves a win | Partial |
 | Fixed-shape whole-prefill graph | Capture profitable fixed prompt/batch shapes without breaking chunked prefill or cache handoff | Implemented; zero-length padding and chunked metadata regression-tested |
@@ -65,9 +60,9 @@ Parity is complete only when all of the following are true:
 | Native W8 speed policy | Add packed/fused projection kernels and card policy; footprint must fall and all-phase speed must pass | Accuracy/balanced/speed policy implemented; Ada 1.5B bsz 1/2/4/8 quant-vs-dense matrix green for FP16 state; strict FP32-state B8 lane also green |
 | Native W4 speed policy | Use Marlin/TorchAO/custom packed kernels as appropriate and select by measured card/shape policy | Hybrid accuracy plus pure-W4 balanced/speed policies implemented; Ada 1.5B bsz 1/2/4/8 quant-vs-dense prefill/decode/E2E matrix green |
 | W8/W4 memory policy | Retain a maximum-compression lane separately from the speed lane | Accuracy and compression lanes exist; BitsAndBytes remains the legacy fallback |
-| SM70 projection/FFN policy | Match the HF V100 fast path without assuming tensor-core features unavailable on Volta | Partial |
-| Ada fixed-shape and quant policy | Pass the HF-defined Qwen3.5/Albatross and W8/W4 matrices independently on 4080 and 4090 | 4080 1.5B bsz 1/2/4/8 dense/W8/W4-vs-dense slice is green and B8 W8 exceeds matched Albatross at T=1/128/512/2048; other Albatross batches, larger models, same-runtime Qwen, and all 4090 cells remain open |
-| Blackwell quant matrix | Run the HF-defined 5090 216-cell matrix and close every Qwen3.5/Albatross red cell | Missing |
+| SM70 projection/FFN policy | Optimize the V100 path without assuming tensor-core features unavailable on Volta | Partial |
+| Ada fixed-shape and quant policy | Pass the repository-defined Qwen3.5/Albatross and W8/W4 matrices independently on 4080 and 4090 | 4080 1.5B bsz 1/2/4/8 dense/W8/W4-vs-dense slice is green and B8 W8 exceeds matched Albatross at T=1/128/512/2048; other Albatross batches, larger models, same-runtime Qwen, and all 4090 cells remain open |
+| Blackwell quant matrix | Run the repository-defined 5090 216-cell matrix and close every Qwen3.5/Albatross red cell | Missing |
 | Apple MLX/Metal performance | Track as an explicit backend/bridge deliverable rather than silently excluding it | Missing |
 | ROCm/AMD policy | Provide HIP-compatible recurrence, dense, and quantized paths with real AMD results | Missing |
 | Dynamic batch state operations | Preserve state isolation under select, reorder, drop, compact, copy-on-write, and slot reuse | Implemented; duplicate-request isolation passed on dense/W8/W4, full performance gate missing |
@@ -75,8 +70,8 @@ Parity is complete only when all of the following are true:
 | STANDALONE speculation | Measure acceptance, rollback/commit cost, state scratch memory, and net throughput | Functional top-k 1; performance gate missing |
 | TP/PP | Require exact output and useful scaling for dense and quantized serving | Functional V100 coverage; performance matrix missing |
 
-`Partial` means that code exists but the complete matched HF matrix and
-promotion evidence do not yet exist. It must not be reported as full parity.
+`Partial` means that code exists but the complete matched acceptance matrix and
+promotion evidence do not yet exist. It must not be reported as complete.
 
 The current measured Ada slice, including every red cell and the FP16-state
 precision caveat, is recorded in
@@ -137,7 +132,7 @@ Every promoted cell must satisfy:
 
 - `qwen_prefill_ratio >= 1.00`;
 - at batch 8, `qwen_decode_ratio >= 1.00` and the model-pair-specific
-  active-work decode threshold from the pinned HF acceptance script (for
+  active-work decode threshold defined by the model-pair policy (for
   RWKV-7 1.5B vs Qwen3.5 2B: `>= 1.75`);
 - `albatross_prefill_ratio >= 1.00` and `albatross_decode_ratio >= 1.00`;
 - SGLang end-to-end throughput and TPOT pass the Qwen3.5 gate at batch 8;
@@ -148,7 +143,7 @@ Every promoted cell must satisfy:
 
 Because SGLang reserves state for concurrent requests, memory reports must show
 both configured server peak and normalized per-active-request memory. Comparing
-an HF batch with an unreported oversized server pool is invalid.
+a reference batch with an unreported oversized server pool is invalid.
 
 ## Hardware acceptance ladder
 
@@ -211,16 +206,16 @@ benchmark/rwkv7/results/<date>/<gpu>/environment.json
 benchmark/rwkv7/results/<date>/<gpu>/summary.md
 ```
 
-Every result must include repository SHAs for SGLang, the HF acceptance
-standard, and source/version identifiers for the Qwen3.5 and Albatross baselines,
+Every result must include the repository revision and acceptance-contract
+version, source/version identifiers for the Qwen3.5 and Albatross baselines,
 checkpoint identifier and hash, hardware/software versions, exact command,
 warm-up/repeat policy, raw measurements, and pass/fail reasons. A summary table
 without raw machine-readable rows is not acceptance evidence.
 
 ## Completion rule
 
-The project may claim **full HF-standard SGLang acceptance** only when the core matrix has
-zero missing cells and zero failed cells on the required hardware targets, all
-serving-superset gates pass, and the results are reproducible from documented
-commands. Individual kernels, cards, or modes may be marked complete earlier,
-but they must not be presented as completion of the overall target.
+The project may claim **full SGLang RWKV-7 acceptance** only when the core
+matrix has zero missing cells and zero failed cells on the required hardware
+targets, all serving-superset gates pass, and the results are reproducible from
+documented commands. Individual kernels, cards, or modes may be marked complete
+earlier, but they must not be presented as completion of the overall target.

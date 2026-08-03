@@ -30,7 +30,7 @@ The native quantized modes are faster than dense fp16 in every measured cell.
 | Native W8 | 2.42 GB | -15.4% |
 | Native W4 | 2.40 GB | -16.1% |
 
-Both quantized modes passed the teacher-forced alignment gate:
+Both quantized modes passed the teacher-forced consistency gate:
 
 - Native W8: maximum chosen-token log-probability error 0.0784, mean top-10
   overlap 0.9813, teacher-forced top-1 agreement 1.0000.

@@ -1,6 +1,6 @@
 {
-  "schema": "rwkv7-quant-alignment-v1",
-  "model": "rwkv7-g1-1.5b-hf",
+  "schema": "rwkv7-quant-consistency-v1",
+  "model": "<checkpoint-root>/rwkv7-g1g-1.5b-checkpoint",
   "dtype": "float16",
   "max_new_tokens": 32,
   "top_k": 10,
@@ -34,8 +34,8 @@
       "mean_token_logprob_error": 0.022941651799555984,
       "mean_top_k_overlap": 0.975,
       "teacher_forced_top1_agreement": 1.0,
-      "free_running_matching_prefix": 32,
-      "free_running_exact": true
+      "free_running_matching_prefix": 5,
+      "free_running_exact": false
     },
     {
       "prompt": "Once upon a time, in a small village by the sea,",

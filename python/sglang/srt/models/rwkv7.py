@@ -14,7 +14,7 @@ the sparse-FFN kernel, choose which projections are quantized. BitsAndBytes and
 the legacy CUDA W8/W4 paths keep low-rank controls and lm_head dense. The
 portable native W8/W4 kernels cover lm_head as well because their row-streaming
 layout is efficient for the wide vocabulary projection and passes the strict
-alignment gate. The WKV recurrence/state and per-channel parameters (x_*, k_k,
+consistency gate. The WKV recurrence/state and per-channel parameters (x_*, k_k,
 k_a, r_k, g_norm) are never weight-quantized.
 
 Tensor parallelism is head-parallel: head_dim stays whole and whole heads are
@@ -987,7 +987,7 @@ class Rwkv7ForCausalLM(nn.Module):
         # Legacy online quantizers keep the vocabulary projection in the
         # activation dtype. The RWKV-native row-streaming kernels deliberately
         # cover lm_head: it is a meaningful memory/decode cost and the native
-        # W8/W4 accuracy policies pass the independent alignment gate.
+        # W8/W4 accuracy policies pass the independent consistency gate.
         lm_head_quant_config = quant_config
         if quant_config is not None and quant_config.get_name() in (
             "bitsandbytes",
@@ -1171,7 +1171,7 @@ class Rwkv7ForCausalLM(nn.Module):
                 and loaded_weight.is_floating_point()
                 and scale_name in params_dict
             ):
-                # Online W8A8: convert an ordinary HF weight to static
+                # Online W8A8: convert an ordinary checkpoint weight to static
                 # per-output-channel symmetric INT8. The layer dynamically
                 # quantizes activations per token and sgl-kernel executes the
                 # scaled INT8 GEMM. Quantize before the normal weight loaders
@@ -1238,7 +1238,7 @@ class RWKV7ForCausalLM(Rwkv7ForCausalLM):
 
 
 class NativeRWKV7ForCausalLM(Rwkv7ForCausalLM):
-    """Architecture alias used by native rwkv-rs/hf-adapter checkpoints."""
+    """Architecture alias used by standard RWKV-7 checkpoints."""
 
     pass
 

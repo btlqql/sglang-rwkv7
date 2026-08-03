@@ -1,5 +1,5 @@
 {
-  "schema": "rwkv7-quant-alignment-v1",
+  "schema": "rwkv7-quant-consistency-v1",
   "model": "RWKV-7 G1 1.5B",
   "dtype": "float16",
   "max_new_tokens": 32,
