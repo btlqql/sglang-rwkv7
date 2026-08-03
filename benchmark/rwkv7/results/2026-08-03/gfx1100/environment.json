@@ -1,0 +1,24 @@
+{
+  "schema": "rwkv7-environment-v1",
+  "gpu": "AMD Radeon Graphics",
+  "arch": "gfx1100",
+  "vram_bytes": 51522830336,
+  "rocm": "7.2.53211-e1a6bc5663",
+  "torch": "2.9.1+gitff65f5b",
+  "triton": "3.5.1",
+  "transformers": "5.12.1",
+  "python": "3.12.3",
+  "platform": "Linux-6.8.0-79-generic-x86_64-with-glibc2.39",
+  "model": "RWKV-7 G1h 1.5B",
+  "batch_size": 8,
+  "prompt_lengths": [
+    128,
+    512,
+    2048
+  ],
+  "decode_length": 128,
+  "warmups": 2,
+  "repeats": 5,
+  "chunked_prefill_size": 8192,
+  "aiter_enabled": false
+}

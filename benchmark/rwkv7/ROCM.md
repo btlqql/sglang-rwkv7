@@ -44,6 +44,14 @@ Additional SGLang arguments can follow the mode.  PyTorch retains the CUDA API
 names for HIP graph capture, so SGLang's flags are still named
 `--cuda-graph-*` on ROCm.
 
+The validated gfx1100 default uses an 8192-token chunked-prefill budget. Set a
+smaller budget for a lower-memory card or a larger checkpoint:
+
+```bash
+SGLANG_RWKV7_ROCM_CHUNKED_PREFILL_SIZE=2048 \
+  benchmark/rwkv7/launch_rocm.sh /path/to/rwkv7-hf native-w8
+```
+
 The helper uses `python` from `PATH`.  Set `SGLANG_PYTHON` when SGLang is in a
 dedicated environment that is not activated in the current shell:
 
@@ -156,6 +164,44 @@ The CUDA/HIP WKV and sparse SqReLU extensions are local JIT fast paths. If the
 installed compiler cannot build one of them, dispatch fails closed to the
 portable Triton WKV or dense FFN implementation.
 
+On ROCm, the JIT loader targets only the active gfx architecture unless the
+operator explicitly sets `PYTORCH_ROCM_ARCH`. This avoids compiling every
+architecture embedded in a broad PyTorch wheel. Sparse compaction supports
+both RDNA wave32 and CDNA wave64. gfx1100 uses a compare-and-swap half2
+accumulator because HIP does not provide CUDA's packed-half `atomicAdd`
+overload on that target.
+
+For large gfx1100 W4 prefills, packed weights remain the persistent model
+storage. One projection is expanded into a transient fp16 buffer and dispatched
+to the tuned rocBLAS GEMM, then released. Small batches continue to use the
+row-streaming packed-W4 kernel. This thresholded path retains the model-memory
+reduction while removing the repeated unpack/scale cost from every large GEMM
+tile.
+
+### Native gfx1100 acceptance
+
+RWKV-7 G1h 1.5B was measured at batch 8 with 128 decode tokens, prompt lengths
+128/512/2048, two warmups, five repeats, and a cache flush before each sample.
+All three modes used the same 8192-token chunked-prefill budget.
+
+| Prompt | Dense prefill | Native W8 | W8/dense | Native W4 | W4/dense |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 10,446.6 | 11,354.3 | 1.087x | 11,165.6 | 1.069x |
+| 512 | 13,777.6 | 14,669.2 | 1.065x | 14,586.6 | 1.059x |
+| 2048 | 13,855.5 | 14,127.7 | 1.020x | 14,059.5 | 1.015x |
+
+Native W8 decode was 760.4-762.4 tok/s and native W4 was 759.2-760.1 tok/s,
+versus 691.9-693.6 tok/s for dense: both quantized paths were about 1.10x dense
+in every decode cell. Loaded weight memory fell from 2.86 GB to 2.42 GB for W8
+and 2.40 GB for W4.
+
+The strict quantized alignment gates passed. W8 reported maximum chosen-token
+log-probability error 0.0784, mean top-10 overlap 0.9813, and top-1 agreement
+1.0000. W4 reported 0.1486, 0.9633, and 0.9922 respectively. Dynamic batching,
+chunked-prefill cold/warm matching, state-cache hits, mixed-length compaction,
+abort, and post-abort reuse also passed. Raw evidence is under
+`results/2026-08-03/gfx1100/`.
+
 ## Current limitations
 
 - Native `sgl-kernel` quantizers require a matching ROCm wheel. Missing
@@ -163,5 +209,6 @@ portable Triton WKV or dense FFN implementation.
   startup.
 - Quark remains unavailable when the installed AITER package lacks
   `aiter.ops.triton.gemm`; other available ROCm quantizers stay registered.
-- Consumer RDNA and CDNA targets require separate performance evidence; a
-  successful HIP JIT build alone is not treated as an acceptance result.
+- gfx1100 RDNA has complete native dense/W8/W4 evidence. CDNA and other RDNA
+  targets still require their own performance runs; successful HIP compilation
+  alone is not treated as acceptance for another architecture.
