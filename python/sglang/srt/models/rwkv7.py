@@ -10,11 +10,12 @@ names mirror the fla-format checkpoint, so ``load_weights`` needs no remapping.
 
 Quantization: the large r/k/v/o_proj and FFN key/value projections are SGLang
 quant-aware linears. RWKV-specific policies, including a W4 lane that preserves
-the sparse-FFN kernel, choose which projections are quantized. Online W8/W4 and
-BitsAndBytes keep low-rank controls and lm_head dense because their small or
-poorly shaped GEMMs add error/latency for little memory benefit. The WKV
-recurrence/state and per-channel parameters (x_*, k_k, k_a, r_k, g_norm) are
-never weight-quantized.
+the sparse-FFN kernel, choose which projections are quantized. BitsAndBytes and
+the legacy CUDA W8/W4 paths keep low-rank controls and lm_head dense. The
+portable native W8/W4 kernels cover lm_head as well because their row-streaming
+layout is efficient for the wide vocabulary projection and passes the strict
+alignment gate. The WKV recurrence/state and per-channel parameters (x_*, k_k,
+k_a, r_k, g_norm) are never weight-quantized.
 
 Tensor parallelism is head-parallel: head_dim stays whole and whole heads are
 split across ranks (r/k/v + LoRA-up column-parallel with no gather, per-channel
@@ -59,9 +60,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.distributed.communication_op import (
-    tensor_model_parallel_all_gather,
-)
+from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import ReLU2
 from sglang.srt.layers.attention.rwkv7_kernels.ffn_sparse_cuda import (
     can_use_sparse_sqrelu_down,
@@ -83,8 +82,10 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.online_utils import (
-    online_quantize_w8a8_int8_weight,
+from sglang.srt.layers.quantization.online_utils import online_quantize_w8a8_int8_weight
+from sglang.srt.layers.quantization.rwkv7_native import (
+    RWKV7W8Config,
+    online_quantize_rwkv7_w4_weight,
 )
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -99,6 +100,7 @@ from sglang.srt.utils import add_prefix, make_layers
 logger = logging.getLogger(__name__)
 
 _RWKV7_W8A8_CONFIG: Optional[QuantizationConfig] = None
+_RWKV7_NATIVE_W8_CONFIG: Optional[QuantizationConfig] = None
 _online_marlin_quantize_weight = None
 _online_marlin_quantize_weight_with_int8_shadow = None
 if (
@@ -156,6 +158,49 @@ def _rwkv7_w4_policy() -> str:
     return policy
 
 
+def _rwkv7_bnb_policy() -> str:
+    """Select the BitsAndBytes accuracy/compression trade-off.
+
+    BitsAndBytes is also the portable W8/W4 path on ROCm.  Quantizing every
+    recurrent projection is useful as a throughput-oriented lane, but it is a
+    poor default for RWKV because projection error is carried in the recurrent
+    state.  The accuracy lane quantizes only the large FFN contraction, while
+    balanced additionally quantizes the FFN expansion.
+    """
+    policy = os.getenv("SGLANG_RWKV7_BNB_POLICY", "accuracy").lower()
+    if policy not in ("accuracy", "balanced", "speed"):
+        raise ValueError(
+            "SGLANG_RWKV7_BNB_POLICY must be accuracy, balanced, or speed; "
+            f"got {policy!r}."
+        )
+    return policy
+
+
+def _rwkv7_bnb_target_modules(
+    quant_config: QuantizationConfig, num_hidden_layers: int
+) -> list[str]:
+    """Return loader targets matching the projection policy above."""
+    policy = _rwkv7_bnb_policy()
+    if policy == "speed":
+        return [
+            ".r_proj.",
+            ".k_proj.",
+            ".v_proj.",
+            ".o_proj.",
+            ".key.",
+            ".value.",
+        ]
+    if policy == "balanced":
+        return [".key.", ".value."]
+    if quant_config.load_in_8bit:
+        return [".value."]
+    edge_layers = min(4, max(1, num_hidden_layers // 6))
+    return [
+        f".layers.{layer_id}.ffn.value."
+        for layer_id in range(edge_layers, num_hidden_layers - edge_layers, 4)
+    ]
+
+
 def _rwkv7_marlin_fallback_max_tokens() -> int:
     """Token-count limit for the batch-invariant W4 accuracy shadow."""
     raw = os.getenv("SGLANG_RWKV7_MARLIN_FALLBACK_MAX_TOKENS", "512")
@@ -187,7 +232,7 @@ def _rwkv7_w4_shadow_mode(hidden_size: int) -> str:
         return "fp16" if hidden_size <= 2048 else "int8"
     if mode not in ("fp16", "int8"):
         raise ValueError(
-            "SGLANG_RWKV7_W4_SHADOW must be auto, fp16, or int8; " f"got {mode!r}."
+            f"SGLANG_RWKV7_W4_SHADOW must be auto, fp16, or int8; got {mode!r}."
         )
     return mode
 
@@ -218,6 +263,13 @@ def _rwkv7_w8a8_config() -> QuantizationConfig:
     return _RWKV7_W8A8_CONFIG
 
 
+def _rwkv7_native_w8_config() -> QuantizationConfig:
+    global _RWKV7_NATIVE_W8_CONFIG
+    if _RWKV7_NATIVE_W8_CONFIG is None:
+        _RWKV7_NATIVE_W8_CONFIG = RWKV7W8Config()
+    return _RWKV7_NATIVE_W8_CONFIG
+
+
 def _rwkv7_projection_quant_config(
     quant_config: Optional[QuantizationConfig],
     projection: str,
@@ -244,21 +296,50 @@ def _rwkv7_projection_quant_config(
         raise ValueError(f"Unknown RWKV-7 projection class: {projection!r}")
 
     name = quant_config.get_name()
-    if name == "w8a8_int8":
-        policy = _rwkv7_w8_policy()
+    if name == "bitsandbytes":
+        policy = _rwkv7_bnb_policy()
         if policy == "speed":
             return quant_config
         if projection == "attention":
             return None
         if policy == "accuracy" and projection == "ffn_key":
             return None
-        if policy == "accuracy" and projection == "ffn_value":
+        if (
+            policy == "accuracy"
+            and not quant_config.load_in_8bit
+            and projection == "ffn_value"
+        ):
+            if layer_id is None or num_hidden_layers is None:
+                raise ValueError("BitsAndBytes W4 FFN policy requires layer metadata")
+            edge_layers = min(4, max(1, num_hidden_layers // 6))
+            if (
+                layer_id < edge_layers
+                or layer_id >= num_hidden_layers - edge_layers
+                or (layer_id - edge_layers) % 4
+            ):
+                return None
+
+    if name in ("w8a8_int8", "rwkv7_w8"):
+        policy = _rwkv7_w8_policy()
+        if policy == "speed":
+            return quant_config
+        if projection == "attention":
+            return None
+        if policy == "accuracy" and projection == "ffn_key" and name == "w8a8_int8":
+            return None
+        if policy == "accuracy" and name == "rwkv7_w8":
+            if layer_id is None or num_hidden_layers is None:
+                raise ValueError("Native W8 FFN policy requires layer metadata")
+            edge_layers = min(4, max(1, num_hidden_layers // 6))
+            if layer_id < edge_layers or layer_id >= num_hidden_layers - edge_layers:
+                return None
+        elif policy == "accuracy" and projection == "ffn_value":
             if layer_id is None or num_hidden_layers is None:
                 raise ValueError("FFN value policy requires layer metadata")
             if layer_id in (0, num_hidden_layers - 1):
                 return None
 
-    if name == "marlin":
+    if name in ("marlin", "rwkv7_w4"):
         policy = _rwkv7_w4_policy()
         if policy == "sparse":
             if projection != "ffn_key":
@@ -287,8 +368,22 @@ def _rwkv7_projection_quant_config(
             edge_layers = min(4, max(1, num_hidden_layers // 6))
             if layer_id < edge_layers or layer_id >= num_hidden_layers - edge_layers:
                 return None
+            if name == "rwkv7_w4":
+                if projection == "ffn_value":
+                    return _rwkv7_native_w8_config()
+                # Keep a real W4 lane while using the faster native W8 kernel
+                # for the intervening expansion projections.
+                return (
+                    quant_config
+                    if (layer_id - edge_layers) % 4 == 0
+                    else _rwkv7_native_w8_config()
+                )
             if projection == "ffn_value" or layer_id % 2:
-                return _rwkv7_w8a8_config()
+                return (
+                    _rwkv7_native_w8_config()
+                    if name == "rwkv7_w4"
+                    else _rwkv7_w8a8_config()
+                )
 
     return quant_config
 
@@ -509,6 +604,8 @@ class Rwkv7Attention(nn.Module):
             "bitsandbytes",
             "marlin",
             "w8a8_int8",
+            "rwkv7_w8",
+            "rwkv7_w4",
         ):
             low_rank_quant_config = None
         self.w_lora = Rwkv7LoRA(
@@ -851,7 +948,6 @@ class Rwkv7FeedForward(nn.Module):
         self._sparse_value_enabled = bool(
             sparse_ffn_enabled()
             and torch.cuda.is_available()
-            and torch.version.hip is None
             and _tp_size() == 1
             and value_quant_config is None
             and getattr(self.value, "weight", None) is not None
@@ -1130,15 +1226,18 @@ class Rwkv7ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        if quant_config is not None and quant_config.get_name() == "bitsandbytes":
+            self.default_bitsandbytes_target_modules = _rwkv7_bnb_target_modules(
+                quant_config, config.num_hidden_layers
+            )
         self.pp_group = get_pp_group()
         self.model = Rwkv7Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        # Keep the vocabulary projection in the activation dtype for online
-        # weight conversion. Its logits are especially sensitive to coarse
-        # per-channel quantization, while retaining it costs little relative
-        # to the six large projections in every RWKV block. This also matches
-        # the usual AWQ/GPTQ policy of leaving lm_head unquantized.
+        # Legacy online quantizers keep the vocabulary projection in the
+        # activation dtype. The RWKV-native row-streaming kernels deliberately
+        # cover lm_head: it is a meaningful memory/decode cost and the native
+        # W8/W4 accuracy policies pass the independent alignment gate.
         lm_head_quant_config = quant_config
         if quant_config is not None and quant_config.get_name() in (
             "bitsandbytes",
@@ -1300,6 +1399,22 @@ class Rwkv7ForCausalLM(nn.Module):
                 )
             param = params_dict[name]
             scale_name = name.removesuffix(".weight") + ".weight_scale"
+            if (
+                name.endswith(".weight")
+                and param.dtype == torch.uint8
+                and loaded_weight.is_floating_point()
+                and scale_name in params_dict
+            ):
+                loaded_weight, weight_scale = online_quantize_rwkv7_w4_weight(
+                    loaded_weight,
+                    group_size=getattr(self.quant_config, "group_size", 128),
+                )
+                scale_param = params_dict[scale_name]
+                scale_loader = getattr(
+                    scale_param, "weight_loader", default_weight_loader
+                )
+                scale_loader(scale_param, weight_scale)
+                loaded_params.add(scale_name)
             if (
                 name.endswith(".weight")
                 and param.dtype == torch.int8

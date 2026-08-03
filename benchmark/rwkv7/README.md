@@ -5,6 +5,8 @@ performance harnesses for native RWKV-7 in SGLang.
 
 - Acceptance contract: [`RWKV7_HF_PARITY.md`](../../RWKV7_HF_PARITY.md)
 - Current RTX 4080 snapshot: [`RESULTS_4080.md`](RESULTS_4080.md)
+- Current gfx1100 ROCm snapshot:
+  [`results/2026-08-03/gfx1100/`](results/2026-08-03/gfx1100/)
 
 A single microbenchmark is not an acceptance result. Promote a configuration
 only after the same model, dtype, state precision, graph mode, batch, prompt,
@@ -321,6 +323,9 @@ including dynamic batching, chunked prefill, and recurrent state-cache hits:
 BitsAndBytes is the legacy functional and memory-saving fallback; it is not the
 optimized quantization speed path. Use online W8A8 or Marlin on their supported
 architectures when throughput is the acceptance criterion.
+
+For AMD/ROCm installation, launch commands, correctness evidence, and measured
+RDNA performance, see [ROCM.md](ROCM.md).
 
 ## Hugging Face alignment
 

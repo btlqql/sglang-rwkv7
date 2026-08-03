@@ -34,6 +34,58 @@ first token. `decode tok/s` counts aggregate output tokens after that first
 batch-wide token. `E2E tok/s` counts all generated output tokens over complete
 request wall time.
 
+## Portable native W8/W4 kernel lane (2026-08-03)
+
+The portable `rwkv7_w8` and `rwkv7_w4` modes now have separate kernels for
+the two serving regimes:
+
+- decode and small batches use a weight-streaming row kernel without dynamic
+  activation quantization;
+- prefills of at least 512 packed tokens use per-token A8, per-channel W8 and
+  an INT32 tensor-core accumulation kernel;
+- W4 expansion weights use symmetric group-32 packing, while the protected
+  contraction lane uses the same native W8 path;
+- recurrent attention, low-rank controls and edge FFN blocks stay FP16 under
+  the default accuracy policy; the native row-streaming kernel also covers the
+  wide LM head.
+
+The matched batch-8 result below uses the workload defined above with 128
+generated tokens. The current dense baseline measured 24,689/28,246/26,416
+prefill tok/s and 1,671/1,664/1,661 decode tok/s at prompt lengths
+128/512/2048 respectively.
+
+| Prompt | Mode | Model memory | Prefill tok/s | Prefill / dense | Decode tok/s | Decode / dense |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 128 | native W8 | 2.41 GB | 31,093 | 1.259x | 1,784 | 1.067x |
+| 512 | native W8 | 2.41 GB | 35,237 | 1.248x | 1,784 | 1.072x |
+| 2048 | native W8 | 2.41 GB | 31,963 | 1.210x | 1,779 | 1.071x |
+| 128 | native W4 | 2.40 GB | 29,575 | 1.198x | 1,765 | 1.056x |
+| 512 | native W4 | 2.40 GB | 33,419 | 1.183x | 1,765 | 1.061x |
+| 2048 | native W4 | 2.40 GB | 30,494 | 1.154x | 1,763 | 1.062x |
+
+The matched dense model load was 2.86 GB, so the native W8 and W4 policies
+reduce reported model-weight memory by 15.7% and 16.1%. Both modes are faster
+than dense in every measured prefill and decode cell. Against the fresh
+Albatross 1.5B batch-8 reference, native W8 reaches 1.091x-1.212x prefill and
+about 1.52x decode; native W4 reaches 1.040x-1.150x prefill and about 1.50x
+decode.
+
+The strict quantized alignment gate also passes:
+
+| Mode | Max chosen-token logprob error | Mean top-10 overlap | Teacher-forced top-1 agreement |
+| --- | ---: | ---: | ---: |
+| native W8 | 0.0932 | 0.9852 | 1.0000 |
+| native W4 | 0.2123 | 0.9492 | 0.9922 |
+
+Both modes pass dynamic-batch isolation, exact cold/warm chunked prefill, a
+128-token state-cache hit, mixed-length compaction, abort termination and
+post-abort slot reuse. Quantized repeated requests use the documented
+four-token prefix gate because near-tied logits can amplify shape-dependent
+low-precision rounding over long recurrent continuations.
+
+Raw evidence is stored under
+[`results/2026-08-03/rtx-4080`](results/2026-08-03/rtx-4080/).
+
 ## Quantization policies
 
 The default policy is `accuracy`.

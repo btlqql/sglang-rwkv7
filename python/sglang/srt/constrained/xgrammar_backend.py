@@ -42,7 +42,12 @@ from sglang.srt.utils import is_hip
 _is_hip = is_hip()
 
 if _is_hip:
-    from sgl_kernel import apply_token_bitmask_inplace_cuda
+    try:
+        from sgl_kernel import apply_token_bitmask_inplace_cuda
+    except (ImportError, OSError):
+        from sglang.kernels.ops.grammar.bitmask_ops import (
+            apply_token_bitmask_inplace_triton as apply_token_bitmask_inplace_cuda,
+        )
 else:
     from sglang.kernels.ops.grammar.bitmask_ops import (
         apply_token_bitmask_inplace_triton,

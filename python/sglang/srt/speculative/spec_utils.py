@@ -81,7 +81,10 @@ if _is_cuda:
     except ImportError:
         from sglang.srt.utils.common import fast_topk
 elif _is_hip:
-    from sgl_kernel import fast_topk
+    try:
+        from sgl_kernel import fast_topk
+    except (ImportError, OSError):
+        from sglang.srt.utils.common import fast_topk
 else:
     from sglang.srt.utils.common import fast_topk
 

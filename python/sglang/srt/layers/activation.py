@@ -122,7 +122,31 @@ if _is_cuda:
 elif _is_xpu:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 elif _is_hip:
-    from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul
+    try:
+        from sgl_kernel import (
+            gelu_and_mul,
+            gelu_quick,
+            gelu_tanh_and_mul,
+            silu_and_mul,
+        )
+    except (ImportError, OSError):
+
+        def _native_act_and_mul(input, out, activation):
+            d = input.shape[-1] // 2
+            out.copy_(activation(input[..., :d]) * input[..., d:])
+
+        def silu_and_mul(input, out):
+            _native_act_and_mul(input, out, F.silu)
+
+        def gelu_and_mul(input, out):
+            _native_act_and_mul(input, out, F.gelu)
+
+        def gelu_tanh_and_mul(input, out):
+            _native_act_and_mul(input, out, lambda x: F.gelu(x, approximate="tanh"))
+
+        def gelu_quick(input, out):
+            out.copy_(input * torch.sigmoid(1.702 * input))
+
 elif _is_musa:
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 
@@ -265,6 +289,9 @@ class ReLU2(MultiPlatformOp):
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         return relu2(x)
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
 
 
 class QuickGELU(MultiPlatformOp):

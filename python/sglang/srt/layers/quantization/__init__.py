@@ -56,9 +56,9 @@ if is_cuda() and not _legacy_cuda:
     except (ImportError, OSError) as exc:
         _sgl_kernel_available = False
         logger.warning(
-            "Native sgl-kernel quantizers are unavailable (%s). Dense and "
+            "Native GPU quantizers are unavailable (%s). Dense and "
             "BitsAndBytes model loading remain enabled; install the matching "
-            "sglang-kernel CUDA/SM wheel to enable native quantization.",
+            "sglang-kernel wheel to enable native quantization.",
             exc,
         )
 
@@ -77,6 +77,7 @@ PetitNvFp4Config = QuarkConfig = QuarkInt4Fp8Config = DummyConfig
 W4AFp8Config = W8A8Fp8Config = W8A8Int8Config = DummyConfig
 
 from sglang.srt.layers.quantization.bitsandbytes import BitsAndBytesConfig
+from sglang.srt.layers.quantization.rwkv7_native import RWKV7W4Config, RWKV7W8Config
 
 if not _legacy_cuda and (not is_cuda() or _sgl_kernel_available):
     from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
@@ -112,7 +113,17 @@ if not _legacy_cuda and (not is_cuda() or _sgl_kernel_available):
     from sglang.srt.layers.quantization.npu_mxfp4_w4a4 import Mxfp4W4A4Config
     from sglang.srt.layers.quantization.nvfp4_online import NvFp4OnlineConfig
     from sglang.srt.layers.quantization.petit import PetitNvFp4Config
-    from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+
+    try:
+        from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+    except (ImportError, OSError) as exc:
+        if not is_hip():
+            raise
+        logger.warning(
+            "Quark quantization is unavailable in this ROCm environment (%s). "
+            "Other ROCm quantizers remain enabled.",
+            exc,
+        )
     from sglang.srt.layers.quantization.quark_int4fp8_moe import QuarkInt4Fp8Config
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
     from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
@@ -138,6 +149,8 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "awq": AWQConfig,
     "awq_marlin": AWQMarlinConfig,
     "bitsandbytes": BitsAndBytesConfig,
+    "rwkv7_w8": RWKV7W8Config,
+    "rwkv7_w4": RWKV7W4Config,
     "gguf": GGUFConfig,
     "gptq": GPTQConfig,
     "gptq_marlin": GPTQMarlinConfig,
@@ -155,6 +168,10 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "humming": HummingConfig,
     "mxfp_w4a8": Mxfp4W4A8Config,
 }
+
+if QuarkConfig is DummyConfig:
+    BASE_QUANTIZATION_METHODS.pop("quark", None)
+    BASE_QUANTIZATION_METHODS.pop("quark_mxfp4", None)
 
 if _legacy_cuda or (is_cuda() and not _sgl_kernel_available):
     BASE_QUANTIZATION_METHODS = {

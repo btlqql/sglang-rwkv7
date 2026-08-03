@@ -1,6 +1,6 @@
 # Copyright 2025-2026 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
-"""Optional JIT CUDA fast path for fp16-state RWKV-7 prefill."""
+"""Optional JIT CUDA/HIP fast path for fp16-state RWKV-7 prefill."""
 
 from __future__ import annotations
 
@@ -18,34 +18,51 @@ logger = logging.getLogger(__name__)
 def _load_wkv_varlen_fp16_extension() -> bool:
     if os.getenv("SGLANG_RWKV7_CUDA_FP16_WKV", "1") == "0":
         return False
-    if not torch.cuda.is_available() or torch.version.hip is not None:
+    if not torch.cuda.is_available():
         return False
-    if torch.cuda.get_device_capability()[0] < 8:
+    if torch.version.hip is None and torch.cuda.get_device_capability()[0] < 8:
         return False
+    previous_rocm_arch = os.environ.get("PYTORCH_ROCM_ARCH")
+    restore_rocm_arch = False
     try:
         from torch.utils.cpp_extension import load
 
         source_dir = Path(__file__).resolve().parent / "cuda"
+        device_flags = ["-O3", "-DNDEBUG"]
+        if torch.version.hip is None:
+            device_flags += ["--use_fast_math"]
+        else:
+            device_flags += ["-ffast-math"]
+            if not previous_rocm_arch:
+                device = torch.cuda.get_device_properties(torch.cuda.current_device())
+                os.environ["PYTORCH_ROCM_ARCH"] = device.gcnArchName.split(":", 1)[0]
+                restore_rocm_arch = True
         load(
-            name="sglang_rwkv7_wkv_varlen_fp16_v3",
+            name="sglang_rwkv7_wkv_varlen_fp16_v4",
             sources=[
                 str(source_dir / "wkv_varlen_fp16.cpp"),
                 str(source_dir / "wkv_varlen_fp16.cu"),
             ],
             extra_cflags=["-O3", "-std=c++17", "-DNDEBUG"],
-            extra_cuda_cflags=["-O3", "--use_fast_math", "-DNDEBUG"],
+            extra_cuda_cflags=device_flags,
             is_python_module=False,
             verbose=os.getenv("SGLANG_RWKV7_CUDA_BUILD_VERBOSE", "0") == "1",
         )
-        logger.info("Loaded the optional RWKV-7 fp16-state CUDA WKV fast path.")
+        logger.info("Loaded the optional RWKV-7 fp16-state CUDA/HIP WKV fast path.")
         return True
     except Exception:
         logger.warning(
-            "Failed to build the optional RWKV-7 fp16-state CUDA WKV; "
+            "Failed to build the optional RWKV-7 fp16-state CUDA/HIP WKV; "
             "falling back to the portable Triton kernel.",
             exc_info=True,
         )
         return False
+    finally:
+        if restore_rocm_arch:
+            if previous_rocm_arch is None:
+                os.environ.pop("PYTORCH_ROCM_ARCH", None)
+            else:
+                os.environ["PYTORCH_ROCM_ARCH"] = previous_rocm_arch
 
 
 def can_use_wkv_varlen_fp16_cuda(

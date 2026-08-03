@@ -1354,6 +1354,9 @@ class ModelConfig:
     def _verify_quantization(self) -> None:
         supported_quantization = [*QUANTIZATION_METHODS]
         rocm_supported_quantization = [
+            "rwkv7_w8",
+            "rwkv7_w4",
+            "bitsandbytes",
             "awq",
             "gptq",
             "fp8",
@@ -1370,6 +1373,8 @@ class ModelConfig:
             "quark_mxfp4",
         ]
         optimized_quantization_methods = [
+            "rwkv7_w8",
+            "rwkv7_w4",
             "fp8",
             "marlin",
             "modelopt_fp8",

@@ -25,6 +25,62 @@
 
 namespace {
 
+#if defined(__HIP_PLATFORM_AMD__)
+#if defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__)
+constexpr int kHardwareWarp = 32;
+#else
+constexpr int kHardwareWarp = 64;
+#endif
+using ballot_type = unsigned long long;
+__device__ __forceinline__ ballot_type rwkv7_ballot(bool predicate) {
+  return __ballot(predicate);
+}
+__device__ __forceinline__ int rwkv7_popcount(ballot_type value) {
+  return __popcll(value);
+}
+
+union rwkv7_half2_bits {
+  half2 value;
+  unsigned bits;
+};
+
+__device__ __forceinline__ void rwkv7_atomic_add_half2(half2 *address,
+                                                       half2 value) {
+  auto *bits = reinterpret_cast<unsigned *>(address);
+  rwkv7_half2_bits old;
+  old.bits = atomicCAS(bits, 0u, 0u);
+  while (true) {
+    const rwkv7_half2_bits assumed = old;
+    const float2 lhs = __half22float2(assumed.value);
+    const float2 rhs = __half22float2(value);
+    rwkv7_half2_bits updated;
+    updated.value = __floats2half2_rn(lhs.x + rhs.x, lhs.y + rhs.y);
+    old.bits = atomicCAS(bits, assumed.bits, updated.bits);
+    if (old.bits == assumed.bits) {
+      return;
+    }
+  }
+}
+#else
+constexpr int kHardwareWarp = 32;
+using ballot_type = unsigned;
+__device__ __forceinline__ ballot_type rwkv7_ballot(bool predicate) {
+  return __ballot_sync(0xffffffffu, predicate);
+}
+__device__ __forceinline__ int rwkv7_popcount(ballot_type value) {
+  return __popc(value);
+}
+
+__device__ __forceinline__ void rwkv7_atomic_add_half2(half2 *address,
+                                                       half2 value) {
+  atomicAdd(address, value);
+}
+#endif
+
+__device__ __forceinline__ ballot_type rwkv7_lane_prefix_mask(int lane) {
+  return lane == 0 ? ballot_type{0} : (ballot_type{1} << lane) - 1;
+}
+
 constexpr int kThreads = 128;
 constexpr int kFfnTile = 128;
 constexpr int kOutputTile = 2 * kThreads;
@@ -34,16 +90,16 @@ __global__ __launch_bounds__(kThreads, 4) void rwkv7_sparse_sqrelu_down_kernel(
     const half *__restrict__ value_weight_t, half *__restrict__ output) {
   __shared__ __align__(256) half activation[kFfnTile];
   __shared__ __align__(256) int nonzero_ids[kFfnTile];
-  __shared__ int warp_counts[kFfnTile / 32];
-  __shared__ int warp_prefix[kFfnTile / 32];
+  __shared__ int warp_counts[kFfnTile / kHardwareWarp];
+  __shared__ int warp_prefix[kFfnTile / kHardwareWarp];
   __shared__ int nonzero_count;
 
   const int f_tile = blockIdx.x;
   const int output_tile = blockIdx.y;
   const int row = blockIdx.z;
   const int tid = threadIdx.x;
-  const int lane = tid & 31;
-  const int warp = tid >> 5;
+  const int lane = tid % kHardwareWarp;
+  const int warp = tid / kHardwareWarp;
   const int f_begin = f_tile * kFfnTile;
   const int output_begin = output_tile * kOutputTile;
 
@@ -54,17 +110,18 @@ __global__ __launch_bounds__(kThreads, 4) void rwkv7_sparse_sqrelu_down_kernel(
   __syncthreads();
 
   const bool nonzero = (__half_as_ushort(activation[tid]) << 1) != 0;
-  const unsigned mask = __ballot_sync(0xffffffffu, nonzero);
-  const int local_position = __popc(mask & ((1u << lane) - 1u));
+  const ballot_type mask = rwkv7_ballot(nonzero);
+  const int local_position =
+      rwkv7_popcount(mask & rwkv7_lane_prefix_mask(lane));
   if (lane == 0) {
-    warp_counts[warp] = __popc(mask);
+    warp_counts[warp] = rwkv7_popcount(mask);
   }
   __syncthreads();
 
   if (tid == 0) {
     int sum = 0;
 #pragma unroll
-    for (int w = 0; w < kFfnTile / 32; ++w) {
+    for (int w = 0; w < kFfnTile / kHardwareWarp; ++w) {
       warp_prefix[w] = sum;
       sum += warp_counts[w];
     }
@@ -88,10 +145,10 @@ __global__ __launch_bounds__(kThreads, 4) void rwkv7_sparse_sqrelu_down_kernel(
         __hfma2(__half2half2(activation[local_f]), weight, accumulator);
   }
 
-  atomicAdd(reinterpret_cast<half2 *>(output +
-                                      static_cast<int64_t>(row) * hidden_size +
-                                      output_begin + tid * 2),
-            accumulator);
+  rwkv7_atomic_add_half2(reinterpret_cast<half2 *>(
+                             output + static_cast<int64_t>(row) * hidden_size +
+                             output_begin + tid * 2),
+                         accumulator);
 }
 
 __global__ __launch_bounds__(256, 2) void rwkv7_sparse_sqrelu_down_t512_kernel(
@@ -101,16 +158,16 @@ __global__ __launch_bounds__(256, 2) void rwkv7_sparse_sqrelu_down_t512_kernel(
   constexpr int kTileThreads = 256;
   __shared__ __align__(256) half activation[kTile];
   __shared__ __align__(256) int nonzero_ids[kTile];
-  __shared__ int warp_counts[kTile / 32];
-  __shared__ int warp_prefix[kTile / 32];
+  __shared__ int warp_counts[kTile / kHardwareWarp];
+  __shared__ int warp_prefix[kTile / kHardwareWarp];
   __shared__ int nonzero_count;
 
   const int f_tile = blockIdx.x;
   const int output_tile = blockIdx.y;
   const int row = blockIdx.z;
   const int tid = threadIdx.x;
-  const int lane = tid & 31;
-  const int warp = tid >> 5;
+  const int lane = tid % kHardwareWarp;
+  const int warp = tid / kHardwareWarp;
   const int f_begin = f_tile * kTile;
   const int output_begin = output_tile * (2 * kTileThreads);
   const int64_t row_offset = static_cast<int64_t>(row) * intermediate_size;
@@ -128,9 +185,10 @@ __global__ __launch_bounds__(256, 2) void rwkv7_sparse_sqrelu_down_t512_kernel(
   for (int u = 0; u < 2; ++u) {
     const int local_f = tid + u * kTileThreads;
     const bool nonzero = (__half_as_ushort(activation[local_f]) << 1) != 0;
-    const unsigned mask = __ballot_sync(0xffffffffu, nonzero);
+    const ballot_type mask = rwkv7_ballot(nonzero);
     if (lane == 0) {
-      warp_counts[warp + u * (kTileThreads / 32)] = __popc(mask);
+      warp_counts[warp + u * (kTileThreads / kHardwareWarp)] =
+          rwkv7_popcount(mask);
     }
   }
   __syncthreads();
@@ -138,7 +196,7 @@ __global__ __launch_bounds__(256, 2) void rwkv7_sparse_sqrelu_down_t512_kernel(
   if (tid == 0) {
     int sum = 0;
 #pragma unroll
-    for (int w = 0; w < kTile / 32; ++w) {
+    for (int w = 0; w < kTile / kHardwareWarp; ++w) {
       warp_prefix[w] = sum;
       sum += warp_counts[w];
     }
@@ -150,9 +208,10 @@ __global__ __launch_bounds__(256, 2) void rwkv7_sparse_sqrelu_down_t512_kernel(
   for (int u = 0; u < 2; ++u) {
     const int local_f = tid + u * kTileThreads;
     const bool nonzero = (__half_as_ushort(activation[local_f]) << 1) != 0;
-    const unsigned mask = __ballot_sync(0xffffffffu, nonzero);
-    const int local_position = __popc(mask & ((1u << lane) - 1u));
-    const int group = warp + u * (kTileThreads / 32);
+    const ballot_type mask = rwkv7_ballot(nonzero);
+    const int local_position =
+        rwkv7_popcount(mask & rwkv7_lane_prefix_mask(lane));
+    const int group = warp + u * (kTileThreads / kHardwareWarp);
     if (nonzero) {
       nonzero_ids[warp_prefix[group] + local_position] = local_f;
     }
@@ -170,10 +229,10 @@ __global__ __launch_bounds__(256, 2) void rwkv7_sparse_sqrelu_down_t512_kernel(
         __hfma2(__half2half2(activation[local_f]), weight, accumulator);
   }
 
-  atomicAdd(reinterpret_cast<half2 *>(output +
-                                      static_cast<int64_t>(row) * hidden_size +
-                                      output_begin + tid * 2),
-            accumulator);
+  rwkv7_atomic_add_half2(reinterpret_cast<half2 *>(
+                             output + static_cast<int64_t>(row) * hidden_size +
+                             output_begin + tid * 2),
+                         accumulator);
 }
 
 } // namespace

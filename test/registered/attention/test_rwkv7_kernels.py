@@ -18,6 +18,10 @@ from sglang.srt.layers.attention.rwkv7_kernels import (
     token_shift_packed_varlen,
     wkv_recurrent,
 )
+from sglang.srt.layers.attention.rwkv7_kernels.ffn_sparse_cuda import (
+    can_use_sparse_sqrelu_down,
+    sparse_sqrelu_down,
+)
 from sglang.srt.layers.attention.rwkv7_kernels.fused import (
     can_fuse_lowrank_controls,
     fused_gate_corr,
@@ -195,6 +199,16 @@ class TestRwkv7Kernels(unittest.TestCase):
         )
         untouched = [index for index in range(len(state_pool)) if index not in (2, 5)]
         torch.testing.assert_close(state_pool[untouched], original_pool[untouched])
+
+    def test_sparse_sqrelu_down_matches_dense(self):
+        preact = torch.randn(8, 2048, device="cuda", dtype=torch.float16)
+        weight_t = (
+            torch.randn(2048, 1024, device="cuda", dtype=torch.float16) * 0.01
+        ).contiguous()
+        self.assertTrue(can_use_sparse_sqrelu_down(preact, weight_t))
+        actual = sparse_sqrelu_down(preact, weight_t)
+        expected = F.relu(preact).square() @ weight_t
+        torch.testing.assert_close(actual, expected, atol=5e-2, rtol=2e-2)
 
     def test_fp16_fast_prefill_matches_published_recurrence(self):
         lengths = [3, 5]
